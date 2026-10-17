@@ -434,7 +434,7 @@ async function loadSettings() {
   state.skills = skillsData.skills || [];
   state.skillsSummary = skillsData.summary || {};
   state.uninstalledSkills = skillsData.uninstalled || [];
-  for (const t of tplData.templates || []) state.personaTemplates[t.id] = { name: t.name, text: t.text, builtin: !!t.builtin };
+  for (const t of tplData.templates || []) state.personaTemplates[t.id] = { name: t.name, text: t.text, customRules: t.customRules || '', builtin: !!t.builtin };
   // 提示词预览与配置并行拉取；渲染时可能还没到（先显示占位，到达后原地替换）
   refreshPromptPreview(cfg);
   renderSettings();
@@ -512,8 +512,9 @@ function refreshModelPriceCard() {
   // 优先级与后端 resolveModelPrice 一致：模型级自定义价命中 > 官方表（开关开）
   // > 全局兜底。曾经开关开时只查官方表 —— 已存自定义价 + 开关开 → 界面显示
   // 官方价、成本看板按自定义价计费，显示与计费两张皮。
-  const customEntry = (api.modelPrices || {})[model];
-  const hasCustom = !!(customEntry && (Number(customEntry.in) || Number(customEntry.out)));
+  const priceVendor = (state.providers || []).find(p => p.id === api.provider)?.displayName || '';
+  const customEntry = findCustomPrice(api.modelPrices, priceVendor, model)?.price;
+  const hasCustom = !!customEntry;
 
   if (hasCustom) {
     locked = true;   // 与后端口径对齐：自定义价命中时 locked = useOfficial
@@ -584,7 +585,7 @@ function refreshModelPriceCard() {
  *   2. 目录之外但已自定义的模型归到虚拟供应商「已自定义（目录外）」，
  *      保证旧条目永远能找到、能清除
  */
-function openBatchPriceModal() {
+async function openBatchPriceModal() {
   const cfg = state.config || {};
   const customMap = cfg.api?.modelPrices || {};
   // 编辑暂存：以已保存的自定义价为起点，用户的每一次输入都先落在这里
@@ -592,14 +593,19 @@ function openBatchPriceModal() {
   for (const [k, v] of Object.entries(customMap)) edits[k] = { ...(v || {}) };
 
   // 左列数据：供应商目录 + 虚拟供应商（目录外已自定义的模型）
+  // 接口回显的模型名可能不同于请求别名；统计中出现过的真实模型也允许按渠道编辑。
+  const usage = await api('/api/usage/stats?range=all').catch(() => ({ models: [] }));
   const catalogModels = new Set();
-  for (const p of (state.providers || [])) for (const m of (p.models || [])) catalogModels.add(m);
+  for (const p of (state.providers || [])) for (const m of (p.models || [])) catalogModels.add(modelPriceKey(p.displayName || p.id, m));
+  for (const m of (usage.models || [])) if ((state.providers || []).some(p => (p.displayName || p.id) === m.vendor)) catalogModels.add(modelPriceKey(m.vendor, m.model));
   const orphanCustoms = Object.keys(customMap).filter((k) => !catalogModels.has(k)).sort();
   const lefts = (state.providers || []).map((p) => ({
-    id: p.id, name: p.displayName || p.id, models: p.models || [], names: p.modelNames || {}
+    id: p.id, name: p.displayName || p.id,
+    models: [...new Set([...(p.models || []), ...(usage.models || []).filter(m => m.vendor === (p.displayName || p.id)).map(m => m.model)])],
+    names: p.modelNames || {}
   }));
   if (orphanCustoms.length) {
-    lefts.push({ id: '__custom__', name: `已自定义（目录外 ${orphanCustoms.length}）`, models: orphanCustoms, names: {} });
+    lefts.push({ id: '__custom__', name: `通用价／目录外（${orphanCustoms.length}）`, models: orphanCustoms, names: {} });
   }
 
   if (!lefts.length) {
@@ -619,7 +625,7 @@ function openBatchPriceModal() {
     body: `
       <div class="ma-toolbar">
         <input type="text" id="bp-search" placeholder="搜索模型…" autocomplete="off" />
-        <span class="muted" style="font-size:12px;white-space:nowrap">留空 = 不自定义（走官方表/兜底）</span>
+        <span class="muted" style="font-size:12px;white-space:nowrap">留空 = 沿用通用价/官方表；填 0 = 免费</span>
       </div>
       <div class="ma-body dual">
         <div class="model-modal-left" id="bp-left"></div>
@@ -646,12 +652,14 @@ function openBatchPriceModal() {
 
   function rowHtml(p, m) {
     if (kw && !m.toLowerCase().includes(kw) && !String(p.names[m] || '').toLowerCase().includes(kw)) return '';
-    const off = matchPriceTable(m, state.modelPrices?.prices || []);
-    const c = edits[m] || {};
+    const key = p.id === '__custom__' ? m : modelPriceKey(p.name, m);
+    const bareModel = m.includes('：') ? m.slice(m.indexOf('：') + 1) : m;
+    const off = matchPriceTable(bareModel, state.modelPrices?.prices || []);
+    const c = edits[key] || {};
     // 官方价不占列（太挤）：placeholder 里有，模型名悬停也有
     const offTitle = off ? `官方价：输入 ${off.in} / 输出 ${off.out} / 缓存 ${off.cached ?? '—'}（元/百万）` : '官方价格表未收录';
     return `
-      <tr data-model="${esc(m)}">
+      <tr data-model="${esc(key)}">
         <td title="${esc(offTitle)}">${esc(p.names[m] || m)}<div class="muted" style="font-size:11px">${esc(m)}</div></td>
         <td><input type="number" step="0.01" min="0" class="bp-in" value="${esc(c.in ?? '')}" placeholder="${off ? off.in : 0}" /></td>
         <td><input type="number" step="0.01" min="0" class="bp-out" value="${esc(c.out ?? '')}" placeholder="${off ? off.out : 0}" /></td>
@@ -679,7 +687,7 @@ function openBatchPriceModal() {
       const sync = () => {
         const num = (sel) => {
           const v = String(tr.querySelector(sel)?.value ?? '').trim();
-          return v === '' ? null : (Number(v) || 0);
+          return v === '' ? null : Number(v);
         };
         const i = num('.bp-in'), o = num('.bp-out'), c = num('.bp-cached');
         if (i === null && o === null && c === null) delete edits[m];
@@ -709,6 +717,10 @@ function openBatchPriceModal() {
   overlay.querySelector('#bp-save').addEventListener('click', async () => {
     // 保存的就是 edits 本身（输入时已实时同步，不用再扫 DOM）
     const next = edits;
+    if (Object.values(next).some(p => ['in', 'out', 'cached'].some(k => p[k] != null && (!Number.isFinite(Number(p[k])) || Number(p[k]) < 0)))) {
+      hintEl.textContent = '单价必须是大于或等于 0 的数字；留空表示不自定义。';
+      return;
+    }
     try {
       hintEl.textContent = '保存中…';
       // 用 __replace__ 整体替换：普通深合并传对象是删不掉旧键的，

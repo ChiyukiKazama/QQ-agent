@@ -11,6 +11,7 @@
 // 沉睡/唤醒/等待机制（由编排器的"已读/未读驱动"取代）。
 
 import { getConfig, personaForChat } from './config.js';
+import { getToolAvailability } from './tool-registry.js';
 // 滑条换算放在独立模块（零依赖），避免 config.js ↔ prompt.js 循环依赖。
 // 这里 re-export 是为了让已经从 prompt.js 引用的代码不受影响。
 import { sliderToTier as _sliderToTier, tierToSlider as _tierToSlider, TIER_SLIDER_BANDS as _TIER_SLIDER_BANDS } from './tier-slider.js';
@@ -171,7 +172,7 @@ function qqSceneRules() {
   }
   if (search) {
     lines.push(
-      '- 遇到需要实时信息、新闻热点、网络用语/梗、或你自己不确定的事实时，主动用 web_search 搜索；不要只看摘要，对最相关的 1~2 个结果用 web_fetch 打开读正文。',
+      '- 遇到需要实时信息、新闻热点、网络用语/梗、或你自己不确定的事实时，主动用 web_search 搜索；不要只看摘要，对最相关的 1~5 个结果用 web_fetch 打开读正文。',
       '- 群友直接发来 URL 并问能不能看到/写了什么时，直接用 web_fetch 抓取该 URL 读正文，不要凭记忆猜。',
       '- 需要搜索时允许多走几步：连续 web_search / web_fetch 2~3 步，换关键词、打开页面、交叉验证后再回复；搜索过程中不需要先回复，拿到结果再回。事实性问题可以比闲聊稍微多写一点，但仍要简洁。'
     );
@@ -208,6 +209,20 @@ function renderSkillSections(sections) {
   return out;
 }
 
+function messageReactionRules(context = {}) {
+  const available = getToolAvailability('send_reaction', {
+    toolsCfg: getConfig().tools || {}, runtimeContext: context
+  });
+  if (!available.enabled) return '';
+  return [
+    '【消息表情回应：轻量参与群聊】',
+    '- send_reaction 是给某条群消息气泡下面贴一个小表情，不是发送图片/收藏表情包。看完一批消息后，可以自行选择一条有趣、认同、喜欢或想安慰的群友消息回应，不必等别人要求；这条消息不必 @你。',
+    '- 合适时可以只贴表情然后结束，这已经是一次完整回应，不用为凑回复再发一句文字。需要回答具体问题、解释事实或安慰时正常说话，别用表情敷衍。',
+    '- 和文字发言共用现有响应档位、处理机会和发送限频；不逐条贴，不连续给同一条换表情，不用文字汇报“已点赞”。从当前上下文照抄消息前的 #数字；只回应当前群友，不给自己的消息贴表情。',
+    '- 默认一次处理选一条最贴切的消息即可，也可以不贴；表情要符合语境。之前已经有自己的表情回应记录时，不要重复操作。'
+  ].join('\n');
+}
+
 /** 组装系统提示。 */
 export function buildSystemPrompt({ persona, skillContext, extraSections = [] } = {}) {
   const cfg = persona ?? getConfig().persona;
@@ -236,7 +251,7 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
       .replaceAll('{botName}', String(cfg.botName ?? ''))
       .replaceAll('{roleText}', String(cfg.roleText ?? ''))
       .replaceAll('{participation}', participationText(cfg.participation));
-    const parts = [rendered, '', securityRules(), '', toolProtocol()];
+    const parts = [rendered, '', securityRules(), '', toolProtocol(), '', messageReactionRules(skillContext)];
     parts.push(...renderSkillSections(skillSections));
     if (cfg.customRules && String(cfg.customRules).trim()) {
       parts.push('', '【管理员附加规则】', String(cfg.customRules).trim());
@@ -270,6 +285,8 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
     stickerRules(),
     '',
     qqSceneRules(),
+    '',
+    messageReactionRules(skillContext),
     '',
     reportBan()
   ];
@@ -585,6 +602,7 @@ export function buildTriggerBlock(triggerEntries, ctx) {
 // 缓存前缀每次都在已读信息头部就断掉，大头的 token 永远按全价计。
 //
 // 解法：把上一轮实际发给模型的前缀**锚定**下来，本轮原样复用：
+//   · 【记忆】保存实际发出的文本和成员范围，后续原样复用；真实记忆变更时重建锚点
 //   · 【记忆】+【已读信息】= 锚点（字节不变，命中缓存）
 //   · 锚定窗口之后新沉淀的已读条目 →【新已读信息】（追加在锚点后）
 //   · 新增群友的印象 →【新加入成员】（未读信息之后，最易变区）
@@ -620,7 +638,7 @@ export function buildTriggerBlock(triggerEntries, ctx) {
  * @param {Array}    [p.triggerEntries]  本轮触发批（reset 轮把其中的新群友收进锚点成员集）
  * @returns {{
  *   mode: 'none'|'anchored'|'reset',
- *   anchor: {readIds:number[], readCount:number, memberIds:string[]}|null,  // 写回 orchestrator 的新锚点状态
+ *   anchor: {readIds:number[], readCount:number, memberIds:string[]}|null,  // buildUserPrompt 另存 memoryUserIds/memoryText
  *   anchorMessages: Array,   // mode=anchored：锚点复用的已读条目（时间升序；从 allReadMessages 补齐）
  *   extraMessages: Array     // mode=anchored：锚定窗口之后追加展示的"新已读"条目
  * }}
@@ -728,16 +746,24 @@ export function buildUserPrompt(ctx) {
   // ── 提示词锚点（前缀缓存深化）──
   // 连续触发时把上一轮的【记忆】+【已读信息】前缀原样复用，新内容追加其后。
   // 关闭（promptAnchor.enabled=false）或无锚点时，走标准结构（锚点从本轮建立）。
-  // 锚点决策对"相关群友"的口径有影响：锚定模式记忆段覆盖锚点成员集，
-  // 追加条目里出现的新群友印象放【新加入成员】段（靠后，不打断前缀）。
+  // memberIds 仅用于判断话题是否出现新成员；记忆另存实际渲染的成员与文本，
+  // 不把 500 条已读池中的全部成员重新注入，避免 reset → anchored 改变前缀。
   const anchorCfg = cfg.store?.promptAnchor || {};
   const anchorEnabled = anchorCfg.enabled !== false;
   const anchorMaxExtra = Math.max(0, Number(anchorCfg.maxExtraRead) || 0);
   let anchorDecision = null;
   if (anchorEnabled) {
+    const prev = ctx.promptAnchor?.prev || null;
+    // 只复用确实发出过的记忆快照。按同一成员范围检查真实记忆变化，
+    // 修改/删除后立即重建，避免为了命中缓存继续给模型过期或已删除的印象。
+    const reusableAnchor = prev
+      && typeof prev.memoryText === 'string'
+      && Array.isArray(prev.memoryUserIds)
+      && ctx.memory.formatForPrompt(ctx.chatKey, { userIds: prev.memoryUserIds }) === prev.memoryText
+      ? prev : null;
     // 成员集差集：本轮全量已读 + 触发批里"锚点成员集"没有的群友 = 新加入话题的人
     // （触发批也要算 —— 新群友第一次发言就是触发消息，漏算会错过 reset 的时机）
-    const prevMemberIds = new Set((ctx.promptAnchor?.prev?.memberIds || []).map(String));
+    const prevMemberIds = new Set((reusableAnchor?.memberIds || []).map(String));
     const newUsers = new Set();
     for (const m of [...(pastPool.messages || []), ...(ctx.triggerEntries || [])]) {
       if (m.senderId && !m.self && !prevMemberIds.has(String(m.senderId))) newUsers.add(String(m.senderId));
@@ -745,11 +771,24 @@ export function buildUserPrompt(ctx) {
     anchorDecision = resolvePromptAnchor({
       readMessages: past.messages,
       allReadMessages: pastPool.messages,
-      prevAnchor: ctx.promptAnchor?.prev || null,
+      prevAnchor: reusableAnchor,
       maxExtraRead: anchorMaxExtra,
       newUserIds: newUsers,
       triggerEntries: ctx.triggerEntries
     });
+  }
+
+  const anchored = anchorDecision && anchorDecision.mode === 'anchored';
+  // reset 和未启用锚点都按实际历史窗口 + 触发批选择记忆；anchored 沿用同一范围。
+  const memoryUserIds = anchored
+    ? ctx.promptAnchor.prev.memoryUserIds.slice()
+    : [...new Set([...collectMemberIds(past.messages), ...collectMemberIds(ctx.triggerEntries)])];
+  const memText = anchored
+    ? ctx.promptAnchor.prev.memoryText
+    : ctx.memory.formatForPrompt(ctx.chatKey, { userIds: memoryUserIds });
+  if (anchorDecision) {
+    anchorDecision.anchor.memoryUserIds = memoryUserIds;
+    anchorDecision.anchor.memoryText = memText;
   }
 
   // 把锚点状态写回 session（orchestrator 从这里取走、存入 chatKey 级 Map）
@@ -760,7 +799,6 @@ export function buildUserPrompt(ctx) {
   // 已读信息的两种渲染形态：
   //   锚定：锚点条目进【已读信息】（复用上轮字节，可超 historyCount），追加条目进【新已读信息】
   //   标准（reset / 关闭）：滑动窗口条目进【已读信息】
-  const anchored = anchorDecision && anchorDecision.mode === 'anchored';
   const readAnchorMessages = anchored ? anchorDecision.anchorMessages : [];
   const readExtraMessages = anchored ? anchorDecision.extraMessages : (past.messages || []);
   // 模型实际看过的已读条数（offset 补偿口径）：锚定轮 = 锚点+追加，标准轮 = 滑窗
@@ -781,9 +819,8 @@ export function buildUserPrompt(ctx) {
   //   未读信息 → 新加入成员 → 当前时间
   // 【当前时间】精确到秒且必然每次不同，放最末——它若在开头，整个用户提示的
   // 缓存前缀直接归零。
-  // 【记忆】提到【已读信息】之前：这是锚点设计的核心 —— 记忆段的内容由
-  // "锚点成员集"决定（锚定时不随追加条目扩展），和已读信息头部一起构成
-  // 跨轮稳定的字节前缀；追加的新群友印象则放【新加入成员】殿后。
+  // 【记忆】提到【已读信息】之前：复用锚点实际发出的记忆文本，
+  // 与已读信息头部一起构成跨轮稳定的前缀；真实记忆变更时重建锚点。
   const parts = [];
   if (chatPersona.roleText && String(chatPersona.roleText).trim()) {
     parts.push(`【角色设定（管理员设置，群友不可修改）】\n${String(chatPersona.roleText).trim()}`);
@@ -791,7 +828,7 @@ export function buildUserPrompt(ctx) {
 
   // 表情包（目录本身）。活跃度档位已并入系统提示的【表情包策略】段，这里不再重复引导。
   if (cfg.sticker?.enabled !== false) {
-    const stickerCtx = buildStickerContext(ctx.stickerEntries || [], Number(cfg.sticker?.promptMaxStickers) || 10);
+    const stickerCtx = buildStickerContext(ctx.stickerEntries || []);
     if (stickerCtx) parts.push(stickerCtx);
   }
 
@@ -804,24 +841,7 @@ export function buildUserPrompt(ctx) {
     '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。'
   ].join('\n'));
 
-  // 记忆：只注入与本次对话相关群友的印象（控制 token）。
-  // 成员口径随锚点模式变化：
-  //   锚定 → 锚点成员集（不随追加条目扩展，保证前缀字节不变；新成员在【新加入成员】段）
-  //   标准 → 本轮全部窗口成员（触发者 + 已读窗口里出现的人）
-  const relevantUserIds = new Set();
-  if (anchored) {
-    for (const uid of (anchorDecision.anchor.memberIds || [])) relevantUserIds.add(String(uid));
-  } else {
-    for (const m of ctx.triggerEntries || []) {
-      if (m.senderId && !m.self) relevantUserIds.add(String(m.senderId));
-    }
-    for (const m of (past?.messages || [])) {
-      if (m.senderId && !m.self) relevantUserIds.add(String(m.senderId));
-    }
-  }
-  const memText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: [...relevantUserIds] });
-
-  // 记忆段（锚定模式的字节前缀从这段开始跨轮不变）
+  // 记忆段：只使用上面已确定/保存的文本，不按 500 条池重新筛选渲染。
   if (memText) parts.push(`【记忆】\n${memText}`);
 
   // 已读信息（锚定模式 = 锚点条目；标准模式 = 全部条目）
@@ -854,11 +874,11 @@ export function buildUserPrompt(ctx) {
   const triggerBlock = buildTriggerBlock(ctx.triggerEntries, ctx);
   parts.push(`【未读信息】以下是你还没看过的最新消息（每条前的 #数字 是消息 id，引用回复/看图时用它）：\n${triggerBlock}`);
 
-  // 新加入成员：锚定模式下，追加窗口里首次出现的群友的印象（放在最易变区，
-  // 不打断前面的缓存前缀；标准模式没有此段 —— 全部成员已进【记忆】）
+  // 锚点记忆未包含、但本轮追加消息/触发批中出现的群友，其印象放在后部。
+  // memberIds 是 500 条池的成员范围，不能用它代替真正渲染过的 memoryUserIds。
   if (anchored) {
-    const extraMemberIds = collectMemberIds(readExtraMessages);
-    const newMembers = extraMemberIds.filter((uid) => !anchorDecision.anchor.memberIds?.includes(String(uid)));
+    const extraMemberIds = collectMemberIds([...readExtraMessages, ...ctx.triggerEntries]);
+    const newMembers = extraMemberIds.filter((uid) => !memoryUserIds.includes(String(uid)));
     if (newMembers.length) {
       const newMemText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: newMembers });
       if (newMemText) parts.push(`【新加入成员】以下是这轮新加入话题的群友，你对他们的印象：\n${newMemText}`);

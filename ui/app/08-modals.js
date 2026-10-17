@@ -147,6 +147,7 @@ function openToolBreakdown() {
   const say = counts.send_message ? `发了 ${counts.send_message} 条消息` : '一条都没发';
   const poke = counts.send_poke ? `、戳了 ${counts.send_poke} 次` : '';
   const sticker = counts.send_sticker ? `、贴了 ${counts.send_sticker} 张表情` : '';
+  const reaction = counts.send_reaction ? `、表情回应 ${counts.send_reaction} 次` : '';
   const search = (Number(counts.web_search) || 0) + (Number(counts.web_fetch) || 0);
   const searchTxt = search ? `、联网查了 ${search} 次` : '';
 
@@ -154,7 +155,7 @@ function openToolBreakdown() {
     head: `调用明细（${state.usageStats?.rangeLabel || ''} · 共 ${total} 次）`,
     body: `
       <div class="tool-breakdown">
-        <div class="tb-lead">这段时间里，机器人${say}${poke}${sticker}${searchTxt}。</div>
+        <div class="tb-lead">这段时间里，机器人${say}${poke}${sticker}${reaction}${searchTxt}。</div>
         ${rows}
       </div>`,
     foot: '<div class="muted tb-foot">工具调用本身不额外计费，成本来自它们消耗的 token。</div>'
@@ -1297,11 +1298,8 @@ async function saveConfig({ quiet = false } = {}) {
         const i = Number(val('#cfg-price-in', 0)) || 0;
         const o = Number(val('#cfg-price-out', 0)) || 0;
         const ca = Number(val('#cfg-price-cached', 0)) || 0;
-        if (i || o || ca) {
-          nextMap[curModel] = { in: i, out: o, cached: ca || i };
-        } else {
-          delete nextMap[curModel];   // 全 0 = 清除自定义，回落到官方表
-        }
+        const priceVendor = (state.providers || []).find(p => p.id === (patch.api.provider || c.api?.provider))?.displayName || '';
+        nextMap[modelPriceKey(priceVendor, curModel)] = { in: i, out: o, cached: ca };
         // 同样需要整体替换，否则 delete 掉的那一项会在合并时复活
         patch.api.modelPrices = { __replace__: nextMap };
       }
@@ -1439,8 +1437,7 @@ async function saveConfig({ quiet = false } = {}) {
     patch.sticker = {
       ...(c.sticker || {}),
       enabled: chk('#cfg-sticker', !!c.sticker?.enabled),
-      encourage: Math.min(3, Math.max(0, Number(val('#cfg-sticker-encourage', c.sticker?.encourage ?? 1)) || 0)),
-      promptMaxStickers: Math.min(50, Math.max(1, Number(val('#cfg-sticker-promptmax', c.sticker?.promptMaxStickers ?? 10)) || 10))
+      encourage: Math.min(3, Math.max(0, Number(val('#cfg-sticker-encourage', c.sticker?.encourage ?? 1)) || 0))
     };
     // 指令禁言（独立折叠卡「指令禁言」，与其他聊天设置一样即时自动保存）
     patch.commandMute = {

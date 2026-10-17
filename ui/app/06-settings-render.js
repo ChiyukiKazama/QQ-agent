@@ -942,7 +942,7 @@ return `
       id: 'card-sticker',
       icon: '😄',
       title: '表情包',
-      sub: '收藏表情同步 / 发送积极度 / 提示词列举数',
+      sub: '收藏表情同步 / 发送积极度 / 全量摘要',
       body: `
       <div class="checkbox-row"><input type="checkbox" id="cfg-sticker" ${c.sticker.enabled ? 'checked' : ''} />
         <label for="cfg-sticker">启用表情包（收藏表情同步 + 发送工具）</label></div>
@@ -958,11 +958,10 @@ return `
         </div>
       </div>
       <div class="field">
-        <label>提示词里列举的表情包数量（1~50）</label>
-        <input type="number" id="cfg-sticker-promptmax" min="1" max="50" value="${esc(Number(c.sticker?.promptMaxStickers) || 10)}" />
+        <label>提示词中的表情摘要</label>
         <div class="hint">
-          每次唤醒时，系统会把收藏表里最多这么多个表情包列进提示词供模型挑选。
-          列得越多模型选择越丰富，但 token 成本也越高；收藏很多时适当调大，收藏少或想省 token 就调小。
+          全量列出 QQ 收藏表情的文字摘要和 ID，保持固定顺序，不按小时轮换。
+          图片由模型按需读取；新增、移除收藏或修改备注时更新摘要。
         </div>
       </div>`
     })}

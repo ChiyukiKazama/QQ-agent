@@ -2,6 +2,7 @@
 // 纯函数在 stickers.js；这里管缓存、TTL 和 OneBot 交互。
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { getConfig, DATA_DIR } from './config.js';
 import { safeFetchBinary } from './safe-fetch.js';
 import {
@@ -69,6 +70,10 @@ export class StickerManager {
       if (!u.toLowerCase().startsWith('file:///')) continue;
       const healed = localStickerPath(u);
       if (!healed) continue;
+      if (!e.md5) {
+        e.md5 = createHash('md5').update(fs.readFileSync(healed)).digest('hex').toUpperCase();
+        changed += 1;
+      }
       const fresh = `file:///${healed.replace(/\\/g, '/')}`;
       if (fresh.toLowerCase() !== u.toLowerCase()) {
         e.url = fresh;
@@ -86,30 +91,38 @@ export class StickerManager {
     return getConfig().sticker?.enabled !== false;
   }
 
+  activeEntries() {
+    return this.entries.filter((e) => e.inQQ !== false);
+  }
+
   /** 同步 QQ 收藏表情（带 TTL 缓存；force 立即刷新）。失败时退回本地缓存。 */
   async sync(force = false) {
-    if (!this.enabled) return { entries: this.entries, fromCache: true, disabled: true };
+    if (!this.enabled) return { entries: this.activeEntries(), fromCache: true, disabled: true };
     const ttl = 60000;
     const now = Date.now();
     if (!force && this.syncedAt && now - this.syncedAt < ttl) {
-      return { entries: this.entries, fromCache: true };
+      return { entries: this.activeEntries(), fromCache: true };
     }
     if (this.syncing) return this.syncing;
     this.syncing = (async () => {
       try {
-        const count = Math.min(500, Math.max(1, Number(getConfig().sticker?.promptMaxStickers) * 10 || 100));
+        // 提示词只展示几张，不能限制实际同步范围，否则列表尾部会被误判为已删除。
+        const count = 10000;
         const data = await this.onebot.call('fetch_custom_face_detail', { count });
         const fetched = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : null);
         if (!fetched) throw new Error('fetch_custom_face_detail 返回 data 不是数组');
+        if (fetched.some((e) => !e || !String(e.emoji_id || e.resId || e.id || '').trim())) {
+          throw new Error('fetch_custom_face_detail 返回了无效表情条目');
+        }
         // 只有拿到合法数组才合并，避免异常响应清空本地库
         const merged = mergeStickerLibrary(this.entries, fetched);
         this.entries = merged;
         this.syncedAt = Date.now();
         saveStickerStore(this.entries);
-        return { entries: this.entries, fromCache: false };
+        return { entries: this.activeEntries(), fromCache: false };
       } catch (error) {
         // 同步失败不致命：本地缓存继续用
-        return { entries: this.entries, fromCache: true, error: String(error?.message ?? error) };
+        return { entries: this.activeEntries(), fromCache: true, error: String(error?.message ?? error) };
       } finally {
         this.syncing = null;
       }
@@ -222,7 +235,8 @@ export class StickerManager {
     if (!url && !file) throw new Error('该消息没有可收藏的图片地址');
     const id = `collected_${messageId}`;
     const noteText = String(note || '');
-    const existing = this.entries.find((e) => e.id === id);
+    await this.sync(false);
+    const existing = this.entries.find((e) => e.id === id || e.aliases?.includes(id));
 
     // ① 图片字节：协议端缓存优先（get_image），其次直链下载
     let bytes = null;
@@ -235,7 +249,7 @@ export class StickerManager {
     }
 
     // ③ QQ 原生收藏（必定调用）：有字节走 base64；没字节把 url 交给 QQ 服务端自取
-    let emojiId = String(existing?.emojiId || '').trim();
+    let emojiId = existing?.inQQ === false ? '' : String(existing?.emojiId || '').trim();
     let qqCollectError = '';
     if (!emojiId) {
       try {
@@ -273,25 +287,33 @@ export class StickerManager {
       // 幂等：重复收藏只更新备注 / 补齐 QQ 身份（上面已按需补调 add_custom_face）
       this.note(id, { note: noteText });
       const target = this.entries.find((e) => e.id === id) || existing;
-      if (emojiId) target.emojiId = emojiId;
-      if (localFile) { target.url = localFile; target.localFile = localFile; }
-      else if (sendUrl && !String(target.url || '').startsWith('file:///')) target.url = sendUrl;
-      if (file) target.qqFile = file;
-      target.persistFailed = !String(target.url || '').startsWith('file:///') && !target.emojiId;
+      // note() 会替换条目引用，兼容已合并到 QQ id 的历史 collected_* 别名。
+      const current = this.entries.find((e) => e.id === target.id) || target;
+      current.localNote = noteText;
+      current.emojiId = emojiId;
+      current.resId = emojiId || current.id;
+      current.inQQ = !!emojiId;
+      if (bytes) current.md5 = createHash('md5').update(bytes).digest('hex').toUpperCase();
+      if (localFile) { current.url = localFile; current.localFile = localFile; }
+      else if (sendUrl && !String(current.url || '').startsWith('file:///')) current.url = sendUrl;
+      if (file) current.qqFile = file;
+      current.persistFailed = !String(current.url || '').startsWith('file:///') && !current.emojiId;
+      this.syncedAt = 0;
       saveStickerStore(this.entries);
-      target.qqCollectError = qqCollectError;   // 仅供本次返回提示
-      return target;
+      current.qqCollectError = qqCollectError;   // 仅供本次返回提示
+      return current;
     }
 
     const entry = {
       id,
       resId: emojiId || id,
       emojiId,
+      inQQ: !!emojiId,
       qqFile: file,
       url: sendUrl,
       sourceUrl: url,                  // 保留原始 url 备查
       localFile,
-      md5: '',
+      md5: bytes ? createHash('md5').update(bytes).digest('hex').toUpperCase() : '',
       desc: noteText.slice(0, 20),
       localNote: noteText,
       tags: [],
@@ -306,6 +328,7 @@ export class StickerManager {
     };
     this.entries.push(entry);
     this.collectTimes.push(now);
+    this.syncedAt = 0;
     saveStickerStore(this.entries);
     entry.qqCollectError = qqCollectError;   // 仅供本次返回提示，不入库
     return entry;

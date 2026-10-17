@@ -25,12 +25,11 @@ const entries = [
   { id: 'id-eight', useCount: 0 }
 ];
 
-check('max=4 的前半包含最高使用次数的两张', () => {
+check('旧 max 参数不再截断：全量列出所有收藏', () => {
   const output = buildStickerContext(entries, 4, { rotatePeriodMin: 60, now: 0 });
   const lines = output.split('\n').filter((line) => line.startsWith('- '));
-  assert.equal(lines.length, 4);
-  assert.ok(lines.slice(0, 2).some((line) => line.includes('id-high')));
-  assert.ok(lines.slice(0, 2).some((line) => line.includes('id-second')));
+  assert.equal(lines.length, entries.length);
+  for (const entry of entries) assert.ok(lines.some(line => line.includes(`id=${entry.id}`)));
 });
 
 check('同一轮次输出完全一致', () => {
@@ -38,21 +37,21 @@ check('同一轮次输出完全一致', () => {
   assert.equal(buildStickerContext(entries, 4, options), buildStickerContext(entries, 4, options));
 });
 
-check('不同轮次得到不同的轮换批', () => {
+check('时间变化不再轮换摘要，输入顺序也不影响结果', () => {
   const first = buildStickerContext(entries, 4, { rotatePeriodMin: 10, now: 0, withId: true });
-  const second = buildStickerContext(entries, 4, { rotatePeriodMin: 10, now: 10 * 60000, withId: true });
-  assert.notEqual(first, second);
+  const second = buildStickerContext([...entries].reverse(), 4, { rotatePeriodMin: 10, now: 10 * 60000, withId: true });
+  assert.equal(first, second);
 });
 
-check('withId 控制 id，且大 max 默认不带 id', () => {
+check('所有摘要保留可供工具使用的 ID，不受旧数量选项影响', () => {
   const withId = buildStickerContext(entries, 4, { rotatePeriodMin: 0, withId: true });
   assert.ok(withId.split('\n').filter((line) => line.startsWith('- ')).every((line) => line.includes('id=')));
   const withoutId = buildStickerContext(entries, 16, { rotatePeriodMin: 0 });
-  assert.ok(withoutId.split('\n').filter((line) => line.startsWith('- ')).every((line) => !line.includes('id=')));
+  assert.ok(withoutId.split('\n').filter((line) => line.startsWith('- ')).every((line) => line.includes('id=')));
 });
 
 // ── 前缀缓存稳定性：useCount 不进提示词文本 ──────────────────────────────
-// 使用计数只参与排序与轮换挑选；写进文本会让每发一次表情就改动【可用表情包】段，
+// 使用计数不再参与摘要排序；写进文本会让每发一次表情就改动【可用表情包】段，
 // 把它后面的全部段落挤出缓存前缀。
 check('useCount 任意变化都不改变输出文本（计数不进提示词）', () => {
   const a = [
@@ -70,12 +69,12 @@ check('useCount 任意变化都不改变输出文本（计数不进提示词）'
   const opts = { rotatePeriodMin: 0, now: 0 };
   const out = buildStickerContext(a, 4, opts);
   assert.equal(out, buildStickerContext(b, 4, opts));
-  // 检查条目行（跳过头部"常用/轮换的"字样）：不含任何使用频次标注
+  // 检查条目行：不含任何使用频次标注
   const itemLines = out.split('\n').filter((line) => line.startsWith('- '));
   assert.ok(itemLines.every((l) => !/用过|次|常用|高频|偶尔/.test(l)), '条目行不应含使用频次标注');
 });
 
-check('总数不超过 max 时全部列出', () => {
+check('少量收藏也全部列出', () => {
   const output = buildStickerContext(entries.slice(0, 3), 4, { rotatePeriodMin: 60 });
   assert.equal(output.split('\n').filter((line) => line.startsWith('- ')).length, 3);
 });

@@ -112,6 +112,8 @@ if (!JSDOM) {
   window.sliderToTier = tier.sliderToTier;
   window.tierToSlider = tier.tierToSlider;
   window.matchPriceTable = priceMod.matchPriceTable;
+  window.modelPriceKey = priceMod.modelPriceKey;
+  window.findCustomPrice = priceMod.findCustomPrice;
 
   window.eval(code);
   await sleep(1500);

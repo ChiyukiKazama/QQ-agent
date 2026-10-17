@@ -116,9 +116,15 @@ try {
   ok('--check 可以正常运行');
 } catch (e) {
   const out = String(e.stdout || '') + String(e.stderr || '');
-  check(out.includes('CLIENT_BUILD'),
-    '--check 会报告协议栈的 CLIENT_BUILD（排查版本问题时第一眼就能看到）',
-    out.slice(0, 400));
+  if (fs.existsSync(path.join(ROOT, 'snowluma', 'index.mjs'))) {
+    check(out.includes('CLIENT_BUILD'),
+      '--check 会报告协议栈的 CLIENT_BUILD（排查版本问题时第一眼就能看到）',
+      out.slice(0, 400));
+  } else {
+    check(e.status === 1 && /SnowLuma:.*缺失/.test(out),
+      '--check 在干净源码目录中明确报告缺失的 SnowLuma，不要求第三方运行时已安装',
+      out.slice(0, 400));
+  }
 }
 
 // ── 6b) 安装器类型识别（纯函数）──────────────────────────────────────

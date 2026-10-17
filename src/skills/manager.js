@@ -42,6 +42,7 @@ export const MULTI_PROVIDER_CAPABILITIES = new Set([
   'llm.usage',
   'llm.retry-advisor',
   'tool.guard',
+  'message.command',
   'media.download'
 ]);
 

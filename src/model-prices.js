@@ -24,6 +24,9 @@
 //
 // 匹配方式见 resolveOfficialPrice()：精确 → 去 provider 前缀 → 前缀匹配。
 
+import { createHash } from 'node:crypto';
+import { findCustomPrice } from '../ui/vendor/price-match.js';
+
 export const OFFICIAL_PRICES = {
   // ══ DeepSeek ══
   // 来源：官方中文文档 https://api-docs.deepseek.com/zh-cn/quick_start/pricing
@@ -520,7 +523,8 @@ export function supportsImage(price) {
    ══════════════════════════════════════════════════════════════
 
    规则（刻意做得简单）：
-     开关开 → 一律走内置官方价格表，且**只读**
+     渠道自定义价（包括全零）→ 旧通用模型价 → 官方表/全局兜底。
+     没有自定义价时，开关开 → 走内置官方价格表，且**只读**
               匹配不到就是单价 0（估不出成本），提示关开关自填
      开关关 → **可编辑**，优先该模型的自定义价，没设则用全局兜底
 
@@ -537,7 +541,8 @@ export function supportsImage(price) {
  *            matched:?string, locked:boolean}}
  */
 export function resolveModelPrice(modelId, cfg, priceTable = null) {
-  const id = String(modelId || '').trim();
+  const identity = splitModelLabel(String(modelId || '').trim());
+  const id = identity.model;
   const api = (cfg && cfg.api) || {};
   const useOfficial = api.useOfficialPrice === true;
 
@@ -546,9 +551,9 @@ export function resolveModelPrice(modelId, cfg, priceTable = null) {
   //     开关开启时直接 return 官方表 —— 用户自定义价静默失效，成本看板
   //     给出错误数字（走中转站时特别常见）。现按文档口径修正：
   //     自定义价命中 > 官方表 > 全局兜底。
-  const custom = (api.modelPrices || {})[id];
-  const hasCustom = !!(custom && (Number(custom.in) || Number(custom.out)));
-  if (hasCustom) {
+  const customMatch = findCustomPrice(api.modelPrices, identity.vendor, id);
+  const custom = customMatch?.price;
+  if (customMatch) {
     return {
       in: Number(custom.in) || 0,
       out: Number(custom.out) || 0,
@@ -556,7 +561,7 @@ export function resolveModelPrice(modelId, cfg, priceTable = null) {
       peak: custom.peak || null,
       image: null,
       source: 'custom',
-      matched: id,
+      matched: customMatch.key,
       // 编辑性只跟官方开关绑定（官方表模式下输入框只读）
       locked: useOfficial
     };
@@ -607,6 +612,16 @@ export function resolveModelPrice(modelId, cfg, priceTable = null) {
     matched: null,
     locked: false
   };
+}
+
+/** 成本快照必须跟随自定义价、官方开关和远程价表失效；不包含密钥等无关配置。 */
+export function pricingSignature(cfg) {
+  const api = cfg?.api || {};
+  return createHash('sha256').update(JSON.stringify([
+    'channel-pricing-v2', api.useOfficialPrice === true,
+    api.priceInputPerM, api.priceOutputPerM, api.priceCachedPerM,
+    api.modelPrices || {}, EFFECTIVE_PRICES
+  ])).digest('hex');
 }
 
 /** 在一张价格表里匹配模型（供前端用本地数据算，不依赖接口往返）。 */

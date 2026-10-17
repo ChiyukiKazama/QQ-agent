@@ -7,16 +7,18 @@
 // 重构说明：所有工具通过 registerTool() 注册到 tool-registry.js，
 // 支持在设置页按卡片勾选启用/禁用。
 import { getConfig } from './config.js';
+import fs from 'node:fs';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
 import { skillManager } from './skills/manager.js';
 import { validateImageUrl, safeFetchBinary, browseLockState, checkBrowseLock } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
-import { expandForwardNodes } from './onebot.js';
+import { readForwardMessage } from './onebot.js';
 import { registerTool, listTools } from './tool-registry.js';
 import { holidayOn, upcomingHoliday } from './holidays.js';
 import { compressImage } from './image-compress.js';
 import { localStickerPath } from './sticker-manager.js';
+import { MESSAGE_REACTIONS, resolveMessageReaction } from './reactions.js';
 import { isGifBuffer, gifToVideoDataUrl, resolveGifRoute } from './gif-to-video.js';
 
 /** 当前配置的 GIF 选路（vision/video 开关组合，规则矩阵见 resolveGifRoute 注释）。 */
@@ -25,9 +27,16 @@ function currentGifRoute() {
   return resolveGifRoute({ vision: cfg.api?.vision !== false, video: cfg.api?.video === true });
 }
 
-async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
-  const safeUrl = await validateImageUrl(url);
-  const { buffer, contentType } = await safeFetchBinary(safeUrl);
+async function downloadImageAsDataUrl(url, timeoutMs = 30000, { sticker = false } = {}) {
+  let buffer, contentType;
+  if (sticker && String(url).startsWith('file:///')) {
+    const local = localStickerPath(url);
+    if (!local) throw new Error('表情的本地缓存不存在或不在受控收藏目录中');
+    buffer = fs.readFileSync(local);
+  } else {
+    const safeUrl = await validateImageUrl(url);
+    ({ buffer, contentType } = await safeFetchBinary(safeUrl));
+  }
   if (!buffer || !buffer.length) throw new Error('图片内容为空');
   // GIF 在这里分岔（规则矩阵见 resolveGifRoute）：
   //   vision+video 都开 → 转 mp4 按 video 部件发（llm.js 自动切视频专用模型）；
@@ -99,6 +108,17 @@ function ok(payload) {
 
 function err(message) {
   return { content: `错误：${message}`, isError: true };
+}
+
+// 少数模型把只读消息工具的参数再包一层 arguments；只兼容这个无歧义的外壳。
+function messageIdArgument(args) {
+  if (args?.messageId !== undefined) return args.messageId;
+  if (!args || Object.keys(args).length !== 1 || !Object.hasOwn(args, 'arguments')) return undefined;
+  let wrapped = args.arguments;
+  if (typeof wrapped === 'string') {
+    try { wrapped = JSON.parse(wrapped); } catch { return undefined; }
+  }
+  return wrapped && typeof wrapped === 'object' && !Array.isArray(wrapped) ? wrapped.messageId : undefined;
 }
 
 // 找不到消息 id 时，把当前会话真实可见的 id 告诉模型，避免它继续瞎猜。
@@ -350,7 +370,7 @@ function registerAllTools() {
         const sticker = await ctx.stickers.find(args.stickerId);
         if (!sticker) return err(`找不到表情 ${args.stickerId}`);
         if (!sticker.url) return err('该表情没有图片地址');
-        const r = await downloadImageAsDataUrl(sticker.url);
+        const r = await downloadImageAsDataUrl(sticker.url, 30000, { sticker: true });
         const built = getImagePartsOrVideo(`表情 ${sticker.id}（备注：${sticker.desc || '无'}）：`, [r]);
         if (r.gifVideo) {
           built.content[0].text += `\n（这是 GIF 动图，已转成 ${r.gifVideo.frames} 帧、最长边 ${Math.max(r.gifVideo.width, r.gifVideo.height) || '≤480'}px 的视频输入，画面按视频发给模型）`;
@@ -417,16 +437,54 @@ function registerAllTools() {
           note: String(args.note ?? '')
         });
         return ok({
-          collected: true,
+          collected: !!saved.emojiId,
           id: saved.id,
           note: saved.localNote,
           emojiId: saved.emojiId || '',
           qqSaved: !!saved.emojiId,
           localSaved: !!saved.localFile,
           ...(saved.qqCollectError
-            ? { warning: `已${saved.localFile ? '本地收藏' : '记录'}，但入 QQ 收藏失败：${saved.qqCollectError}` }
+            ? { warning: `入 QQ 收藏失败，未加入可用表情库（${saved.localFile ? '图片已本地缓存' : '仅保留记录'}）：${saved.qqCollectError}` }
             : {})
         });
+      } catch (error) {
+        return err(error?.message ?? error);
+      }
+    }
+  });
+
+  registerTool({
+    id: 'send_reaction',
+    name: '消息表情回应',
+    description: '给当前群聊里某条消息贴表情（消息气泡下方的小表情，不是发送收藏表情包）。可以自主用来赞同、接梗、表达喜欢或安慰；贴一次就能完成回应，不必再发文字。messageId 照抄当前聊天里的 #数字。emoji 可选：' + MESSAGE_REACTIONS.map(r => `${r.name}${r.emoji}`).join('、') + '。不要逐条贴或反复给同一条换表情。',
+    category: 'messaging',
+    icon: '👍',
+    parameters: {
+      type: 'object',
+      properties: {
+        messageId: { type: ['integer', 'string'], description: '当前群聊中要回应的消息 id，支持负数，照抄 # 后的数字' },
+        emoji: { type: 'string', enum: MESSAGE_REACTIONS.map(r => r.name), description: '根据消息内容选择表情' },
+        cancel: { type: 'boolean', description: '可选；true 取消自己此前贴的这个表情，默认 false 添加' }
+      },
+      required: ['messageId', 'emoji']
+    },
+    async execute(ctx, args) {
+      try {
+        if (ctx.kind !== 'group') return err('表情回应仅支持群聊消息');
+        const mid = String(args.messageId ?? '').trim();
+        if (!/^-?\d+$/.test(mid) || !Number.isSafeInteger(Number(mid)) || Number(mid) === 0) return err('messageId 必须照抄聊天记录里 # 后的数字（可以是负数）');
+        const entry = ctx.store.findByMid(ctx.chatKey, mid);
+        if (!entry) return err(`当前会话找不到消息 ${mid}。${midHint(ctx)}`);
+        if (entry.self) return err('请回应群友的消息，不要给自己的发言贴表情');
+        const reaction = resolveMessageReaction(args.emoji);
+        if (!reaction) return err(`emoji 请选择：${MESSAGE_REACTIONS.map(r => r.name).join('、')}`);
+        if (args.cancel !== undefined && typeof args.cancel !== 'boolean') return err('cancel 必须是布尔值');
+        const cancel = args.cancel === true;
+        const result = await ctx.sender.react(ctx.chatKey, entry.mid, reaction, cancel);
+        if (result.duplicate) return ok({ reacted: false, duplicate: true, note: '相同表情回应刚刚已经完成，无需重复操作。' });
+        ctx.session.sent.push({ type: 'reaction', text: `[${cancel ? '取消表情回应' : '表情回应'}] #${entry.mid} ${reaction.emoji}`, messageId: entry.mid, emoji: reaction.name, at: new Date().toLocaleTimeString('zh-CN', { hour12: false }) });
+        ctx.emit('session-update', ctx.session.id);
+        return ok({ reacted: true, messageId: entry.mid, emoji: reaction.name, cancelled: cancel, note: '表情回应已完成，可以直接结束，不需要补发操作汇报或文字。' });
       } catch (error) {
         return err(error?.message ?? error);
       }
@@ -499,7 +557,7 @@ function registerAllTools() {
   registerTool({
     id: 'read_forward',
     name: '展开转发消息',
-    description: '展开查看合并转发的聊天记录。消息文本出现 [合并转发聊天记录] 或 [转发消息 …] 占位符时用。参数填那条转发消息前的 #数字（千万别用方括号里那串长 id，会过期报错）。展开结果会写回存档，以后再看就是展开的文本，不用重复调。',
+    description: '逐层展开合并转发及其嵌套聊天记录，保留发言人和图片。参数填最外层转发消息前的 #数字，不要填写内层引用 id。结果写回存档；遇到过期、循环或读取上限会明确说明，未完整展开的记录允许重试。查看其中图片仍用同一条消息 id 调 get_message_images。',
     category: 'query',
     icon: '📨',
     parameters: {
@@ -511,19 +569,21 @@ function registerAllTools() {
     },
     async execute(ctx, args) {
       try {
-        const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
-        if (!entry) return err(`当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
+        const messageId = messageIdArgument(args);
+        if (messageId == null || String(messageId).trim() === '') return err('缺少 messageId。参数应为 {"messageId":"聊天记录里的消息 id"}，请按此格式重试。');
+        const entry = ctx.store.findByMid(ctx.chatKey, messageId);
+        if (!entry) return err(`当前会话找不到消息 ${messageId}。${midHint(ctx)}`);
         // 存档里已是展开文本（收消息时已展开/之前展开过）→ 直接给，不再请求 QQ
-        if (String(entry.text || '').startsWith('[合并转发 共')) {
+        const limits = getConfig().store?.forward || {};
+        if (entry.forwardRead?.version === 1 && entry.forwardRead.complete
+            && ['maxDepth', 'maxNodes', 'maxChars'].every((key) => !limits[key] || entry.forwardRead[key] === Number(limits[key]))) {
           return ok({ messageId: entry.mid, text: entry.text, note: '该转发已展开（读的是存档）' });
         }
-        const r = await ctx.onebot.call('get_forward_msg', { message_id: Number(entry.mid) });
-        const nodes = Array.isArray(r?.messages) ? r.messages : [];
-        const ex = await expandForwardNodes(nodes);
+        const ex = await readForwardMessage(ctx.onebot, entry.mid, limits);
         if (!ex || !ex.text) return err('转发内容为空或已被 QQ 服务端丢弃（发送时间太久）');
         // 写回存档：一次展开，永久升级这条记录（模型/存档页/金句墙都受益）
-        ctx.store.updateByMid(ctx.chatKey, entry.mid, { text: ex.text, appendMedia: ex.media || [] });
-        return ok({ messageId: entry.mid, text: ex.text, images: (ex.media || []).length });
+        ctx.store.updateByMid(ctx.chatKey, entry.mid, { text: ex.text, appendMedia: ex.media || [], forwardRead: ex.forwardRead });
+        return ok({ messageId: entry.mid, text: ex.text, images: (ex.media || []).filter((m) => m.kind === 'image').length, complete: ex.complete });
       } catch (error) {
         return err(`展开失败：${error?.message ?? error}`);
       }
@@ -619,10 +679,12 @@ function registerAllTools() {
     },
     async execute(ctx, args) {
       try {
-        const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
-        if (!entry) return err(`当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
+        const messageId = messageIdArgument(args);
+        if (messageId == null || String(messageId).trim() === '') return err('缺少 messageId。参数应为 {"messageId":"聊天记录里的消息 id"}，请按此格式重试。');
+        const entry = ctx.store.findByMid(ctx.chatKey, messageId);
+        if (!entry) return err(`当前会话找不到消息 ${messageId}。${midHint(ctx)}`);
         const urls = (entry.media || []).filter((m) => m.kind === 'image' && m.url).map((m) => m.url);
-        if (!urls.length) return ok(`消息 ${args.messageId} 没有可查看的图片`);
+        if (!urls.length) return ok(`消息 ${messageId} 没有可查看的图片`);
         const results = [];
         const failed = [];
         for (const url of urls) {
@@ -637,7 +699,7 @@ function registerAllTools() {
           imageCount ? `${imageCount} 张图片` : '',
           videoCount ? `${videoCount} 段视频（由 GIF 动图转换，≤480px/≤24帧）` : ''
         ].filter(Boolean).join(' + ');
-        const built = getImagePartsOrVideo(`消息 ${args.messageId} 的内容${note}：${what}。`, results);
+        const built = getImagePartsOrVideo(`消息 ${messageId} 的内容${note}：${what}。`, results);
         return built;
       } catch (error) {
         return err(error?.message ?? error);

@@ -1,7 +1,7 @@
 // OpenAI 兼容 Chat Completions 客户端（非流式）。
 // 支持工具调用、usage 统计、可自选模型 —— 这是与 DSH 解耦后的"大脑"接口。
 import { getConfig } from './config.js';
-import { resolveModelPrice, priceAt } from './model-prices.js';
+import { resolveModelPrice, priceAt, modelLabel, vendorOfConfig } from './model-prices.js';
 import { skillManager } from './skills/manager.js';
 import {
   resolveThinkingRequest, buildThinkingParams, stripThinkingParams,
@@ -657,7 +657,9 @@ export function estimateCost(usage, opts = {}) {
   // 统一走 resolveModelPrice：自定义 > 内置官方表 > 全局兜底
   // 注意：第二个参数要传完整配置对象（内部读 cfg.api.*），
   // 传 effectiveApi() 的返回值（它就是 api 本身）会导致取不到字段。
-  const p = resolveModelPrice(model, getConfig());
+  const fullCfg = getConfig();
+  const identity = model.includes('：') ? model : modelLabel(opts.vendor ?? vendorOfConfig(fullCfg), model);
+  const p = resolveModelPrice(identity, fullCfg);
 
   // 峰谷：传了 at（调用时刻）且该模型有 peak 档位就取对应档
   const tier = p.peak && opts.at ? priceAt(p, opts.at) : null;

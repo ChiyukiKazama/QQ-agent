@@ -1,0 +1,11 @@
+{
+  "id": "system-status",
+  "name": "系统状态",
+  "version": "1.0.2",
+  "apiVersion": 1,
+  "enabledByDefault": true,
+  "category": "utility",
+  "description": "@机器人发送“状态”或“系统状态”，直接回复本机系统、存储和资源监控；不调用模型。私聊可直接发送指令。",
+  "entry": "index.js",
+  "capabilities": ["message.command"]
+}

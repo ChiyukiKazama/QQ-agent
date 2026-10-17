@@ -521,6 +521,7 @@ const TOOL_META = {
   send_message:      { name: '发消息',     cat: '发言',   icon: '💬' },
   send_sticker:      { name: '发表情包',   cat: '发言',   icon: '🎴' },
   send_poke:         { name: '戳一戳',     cat: '发言',   icon: '👆' },
+  send_reaction:     { name: '表情回应',   cat: '发言',   icon: '👍' },
   // 查看类
   get_recent_messages: { name: '翻聊天记录', cat: '查看', icon: '📜' },
   get_message_detail:  { name: '看消息详情', cat: '查看', icon: '🔍' },

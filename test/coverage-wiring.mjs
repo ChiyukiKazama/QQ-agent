@@ -70,6 +70,8 @@ window.TIER_SLIDER_BANDS = tier.TIER_SLIDER_BANDS;
 window.sliderToTier = tier.sliderToTier;
 window.tierToSlider = tier.tierToSlider;
 window.matchPriceTable = priceMod.matchPriceTable;
+window.modelPriceKey = priceMod.modelPriceKey;
+window.findCustomPrice = priceMod.findCustomPrice;
 
 window.eval(code);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -188,6 +188,9 @@ export function getToolAvailability(toolId, context = {}) {
   }
 
   // 6) 运行期依赖
+  if (def.id === 'send_reaction' && runtimeContext.kind === 'private') {
+    return deny('group-only', '消息表情回应仅支持群聊');
+  }
   if (def.requiresVision && !visionEnabled) {
     return deny('no-vision', '当前模型不支持图片输入');
   }

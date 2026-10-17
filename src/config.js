@@ -83,7 +83,7 @@ export const DEFAULT_CONFIG = {
     // 远程价格表地址由 src/community.js 固定为官网公开表（FIXED_PRICE_FEED_URL），
     // 任何代码都不得再读/写 api.priceRemoteUrl —— 它是已废弃的历史字段，
     // loadConfig 时统一剔除（见 stripObsoleteFields），避免磁盘旧值继续冒充"生效地址"。
-    // 按模型单独设定的价格：{ [模型 id]: { in, out, cached } }
+    // 按渠道和模型定价：{ ['渠道：模型 id']: { in, out, cached } }，兼容旧的裸模型键。
     // 优先级最高 —— 一旦这里有记录，就不再用内置官方表，也不受全局默认单价影响。
     // 改动只存在这里，不会回写内置价格表（src/model-prices.js）。
     modelPrices: {}
@@ -241,7 +241,6 @@ export const DEFAULT_CONFIG = {
   // 表情包
   sticker: {
     enabled: true,
-    promptMaxStickers: 10,
     collectEnabled: true,
     maxCollectPerHour: 10,
     // 发表情包的积极程度（0=不鼓励 1=偶尔 2=较积极 3=很积极）。
@@ -257,6 +256,8 @@ export const DEFAULT_CONFIG = {
     //   - store 的 #trim 在 maxPerChat<=0 时直接跳过
     // 注意：单群文件会随时间增长，磁盘占用请自行留意。
     maxMessagesPerChat: 0,
+    // 合并转发的全树读取预算（根转发算第 1 层）；可在 data/config.json 调整。
+    forward: { maxDepth: 5, maxNodes: 30, maxChars: 3000 },
     // ── 上下文读取档位（决定哪些消息会触发响应）──
     // 档位是"累积生效"的：选 4 档时 1/2/3 档也都生效，按 4→3→2→1 顺序检查，
     // 第一个命中的决定是否响应。
@@ -507,6 +508,8 @@ const OBSOLETE_PATHS = [
   ['api', 'priceRemoteUrl'],
   ['budget'],
   ['providersImported'],
+  // 收藏表情摘要改为全量、固定顺序，不再按数量截断或轮换。
+  ['sticker', 'promptMaxStickers'],
   // 2026-09-25 档位改版：四个分档条数字段废弃，统一为 store.historyCount。
   // 老配置里的存量值会在 loadConfig 时被剔除（读条数走 historyCount / allCount 迁移兜底）。
   ['store', 'atCount'],

@@ -98,6 +98,8 @@ sandbox.globalThis = sandbox;
 const { TIER_SLIDER_BANDS, sliderToTier, tierToSlider } = await import('../src/tier-slider.js');
 const { matchPriceTable } = await import('../src/model-prices.js');
 Object.assign(sandbox, { TIER_SLIDER_BANDS, sliderToTier, tierToSlider, matchPriceTable });
+const { modelPriceKey, findCustomPrice } = await import('../ui/vendor/price-match.js');
+Object.assign(sandbox, { modelPriceKey, findCustomPrice });
 
 // app.js 是 ES module（浏览器里 type="module"），vm.Script 跑不了 export ——
 // 剥掉前缀再执行，否则新增任何一个 export 都会让本测试整个崩掉。

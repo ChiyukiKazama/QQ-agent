@@ -360,6 +360,14 @@ export class OneBotClient {
     return this.sendSegments(kind, id, segments);
   }
 
+  /** 给现有群消息贴表情，不产生新的消息气泡；群号用于网关侧校验消息归属。 */
+  reactToMessage(groupId, messageId, emojiId, cancel = false) {
+    return this.call('set_group_reaction', {
+      group_id: String(groupId), message_id: messageId,
+      code: String(emojiId), is_set: !cancel
+    });
+  }
+
   /**
    * 发送一张图片（独立气泡）。
    *
@@ -404,8 +412,9 @@ export class OneBotClient {
 // ── 入站事件 → 文本（移植自原版 segmentsToText） ─────────────────────────
 
 export function forwardIdFromData(d) {
-  const raw = d?.id ?? d?.res_id ?? d?.forward_id ?? d?.data_id;
-  if (raw == null || String(raw).trim() === '') return null;
+  const raw = [d?.id, d?.res_id, d?.forward_id, d?.data_id]
+    .find((value) => value != null && String(value).trim() !== '');
+  if (raw == null) return null;
   return String(raw);
 }
 
@@ -507,54 +516,181 @@ export function extractMediaFromSegments(segments) {
   return media;
 }
 
-/**
- * 展开合并转发节点为可读文本（纯函数，便于测试）。
- *
- * 背景：OneBot 事件里的 forward 段只有一个 res_id 占位符，
- * 需要 get_forward_msg 拿回节点数组（本函数处理的就是这个数组）。
- * 实测 NapCat：{ message_id } 可用；res_id 会过期（payload is empty），别依赖。
- *
- * 规则：
- *   - 每个节点一行「昵称: 内容」，内容复用 segmentsToText（@/图片/表情等占位一致）
- *   - 嵌套转发不再展开（深度 1 封顶，套娃截断）
- *   - 封顶：maxNodes 条 / maxChars 字符，超出注明"还有 N 条未展开"
- *   - 节点里的图片段同时提取到 media（url 新鲜，可用于取图/金句）
- *
- * @param {Array} nodes get_forward_msg 返回的 messages 数组
- * @returns {{ text: string, media: Array } | null} 无可用节点返回 null
- */
-export async function expandForwardNodes(nodes, { maxNodes = 30, maxChars = 3000 } = {}) {
-  if (!Array.isArray(nodes) || !nodes.length) return null;
-  const lines = [];
-  const media = [];
-  let truncated = 0;
+function forwardLimits(options = {}) {
+  const positive = (value, fallback) => Number.isFinite(Number(value)) && Number(value) > 0
+    ? Math.max(1, Math.floor(Number(value))) : fallback;
+  return {
+    maxDepth: positive(options.maxDepth, 5),
+    maxNodes: positive(options.maxNodes, 30),
+    maxChars: positive(options.maxChars, 3000)
+  };
+}
 
-  for (let i = 0; i < nodes.length; i++) {
-    if (lines.length >= maxNodes) { truncated = nodes.length - i; break; }
-    const n = nodes[i] || {};
-    // 发言人带 QQ 号（与主历史同口径）：转发记录里的人也要能被稳定识别
-    const rawName = String(n.sender?.card || n.sender?.nickname || n.user_id || '?');
-    const nid = String(n.sender?.user_id ?? n.user_id ?? '').trim();
-    const name = nid && nid !== rawName ? `${rawName}(QQ:${nid})` : rawName;
-    const nm = n.message ?? n.content;
-    let body = '';
-    if (typeof nm === 'string') {
-      // 字符串形态一般是 CQ 码原文，剥掉 [CQ:xxx] 段保留纯文本
-      body = nm.replace(/\[CQ:[^\]]*\]/g, '').trim();
-    } else if (Array.isArray(nm)) {
-      // 嵌套 forward 段清空 data → segmentsToText 输出 [转发消息] 占位（深度 1 封顶）
-      const segs = nm.map((s) => (s?.type === 'forward' ? { type: 'forward', data: {} } : s));
-      body = await segmentsToText(segs, {});
-      media.push(...extractMediaFromSegments(segs));
+function forwardNodes(result) {
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result?.messages)) return result.messages;
+  if (Array.isArray(result?.data?.messages)) return result.data.messages;
+  return [];
+}
+
+// 某些 OneBot 实现返回 CQ 字符串；保留其中的转发引用和媒体，而不是直接剥掉。
+function forwardSegments(message) {
+  if (Array.isArray(message)) return message;
+  if (typeof message !== 'string') return [];
+  const decode = (s) => s.replaceAll('&#44;', ',').replaceAll('&#91;', '[')
+    .replaceAll('&#93;', ']').replaceAll('&amp;', '&');
+  const segments = [];
+  let offset = 0;
+  for (const match of message.matchAll(/\[CQ:([a-z_]+)((?:,[^\]]*)?)\]/g)) {
+    if (match.index > offset) segments.push({ type: 'text', data: { text: decode(message.slice(offset, match.index)) } });
+    const data = {};
+    for (const param of match[2].split(',').slice(1)) {
+      const eq = param.indexOf('=');
+      if (eq > 0) data[param.slice(0, eq)] = decode(param.slice(eq + 1));
     }
-    body = body.replace(/\s+/g, ' ').trim().slice(0, 200);
-    if (!body) continue;
-    lines.push(`${name}: ${body}`);
-    if (lines.join('\n').length > maxChars) { truncated = nodes.length - i - 1; break; }
+    segments.push({ type: match[1], data });
+    offset = match.index + match[0].length;
+  }
+  if (offset < message.length) segments.push({ type: 'text', data: { text: decode(message.slice(offset)) } });
+  return segments;
+}
+
+/**
+ * 递归读取整个转发树。节点、字符和请求预算由整棵树共享；单个分支失败不丢弃其余内容。
+ * resolveForward 只接收协议返回的真实引用，模型不能自行指定跨会话的转发 id。
+ */
+export async function expandForwardNodes(nodes, options = {}) {
+  if (!Array.isArray(nodes) || !nodes.length) return null;
+  const limits = forwardLimits(options);
+  const { maxDepth, maxNodes, maxChars } = limits;
+  const lines = [`[合并转发 共${nodes.length}条]`];
+  const media = [];
+  const mediaSeen = new Set();
+  const activeIds = new Set(options.rootId ? [String(options.rootId)] : []);
+  const activeLists = new WeakSet();
+  const cache = new Map();
+  let chars = lines[0].length;
+  let nodesRead = 0;
+  let requests = 0;
+  let complete = true;
+  let stopped = '';
+
+  function append(text) {
+    if (stopped) return;
+    const line = sanitizeUserText(String(text)).replace(/\r?\n/g, ' ');
+    const remaining = maxChars - chars - 1;
+    if (line.length > remaining) {
+      if (remaining > 0) lines.push(line.slice(0, remaining));
+      stopped = '文本长度';
+      complete = false;
+    } else {
+      lines.push(line);
+      chars += line.length + 1;
+    }
+  }
+  function note(indent, reason) {
+    complete = false;
+    append(`${indent}[内层转发未展开：${reason}]`);
   }
 
-  const head = `[合并转发 共${nodes.length}条]`;
-  if (!lines.length) return { text: head, media };
-  const tail = truncated > 0 ? `\n…（还有 ${truncated} 条未展开）` : '';
-  return { text: `${head}\n${lines.join('\n')}${tail}`, media };
+  async function walk(list, depth) {
+    if (activeLists.has(list)) { note('  '.repeat(depth - 1), '循环引用'); return; }
+    activeLists.add(list);
+    try {
+      for (const raw of list) {
+        if (stopped) break;
+        if (nodesRead >= maxNodes) { stopped = '节点数'; complete = false; break; }
+        nodesRead++;
+        const n = raw?.type === 'node' ? (raw.data || {}) : (raw || {});
+        const indent = '  '.repeat(depth - 1);
+        const rawName = String(n.sender?.card || n.sender?.nickname || n.nickname || n.user_id || '?');
+        const nid = String(n.sender?.user_id ?? n.user_id ?? '').trim();
+        const name = nid && nid !== rawName ? `${rawName}(QQ:${nid})` : rawName;
+        const segments = forwardSegments(n.message ?? n.content);
+        const nested = segments.filter((s) => s?.type === 'forward' || s?.type === 'node');
+        const display = segments.map((s) => s?.type === 'forward' || s?.type === 'node'
+          ? { type: 'text', data: { text: '[内层转发]' } } : s);
+        const body = (await segmentsToText(display, {})).replace(/\s+/g, ' ').trim();
+        if (body) append(`${indent}${name}: ${body}`);
+        if (stopped) break;
+        for (const item of extractMediaFromSegments(segments)) {
+          const key = JSON.stringify([item.kind, item.url, item.file, item.faceId]);
+          if (!mediaSeen.has(key)) { media.push(item); mediaSeen.add(key); }
+        }
+        for (const seg of nested) {
+          if (stopped) break;
+          if (nodesRead >= maxNodes) { stopped = '节点数'; complete = false; break; }
+          if (depth >= maxDepth) { note(`${indent}  `, `达到 ${maxDepth} 层上限`); continue; }
+          const data = seg.data || {};
+          const embedded = seg.type === 'node' ? [data]
+            : [data.content, data.messages, data.nodes].find(Array.isArray);
+          if (embedded) {
+            if (embedded.length) await walk(embedded, depth + 1);
+            else note(`${indent}  `, '内容为空');
+            continue;
+          }
+          const id = forwardIdFromData(data);
+          if (!id) { note(`${indent}  `, '缺少转发引用'); continue; }
+          if (activeIds.has(id)) { note(`${indent}  `, '循环引用'); continue; }
+          if (typeof options.resolveForward !== 'function') { note(`${indent}  `, '未提供读取接口'); continue; }
+          activeIds.add(id);
+          try {
+            if (!cache.has(id)) {
+              if (requests >= maxNodes) { note(`${indent}  `, '达到请求数上限'); continue; }
+              requests++;
+              // 缓存失败结果也能避免同一条坏引用被重复请求。
+              cache.set(id, Promise.resolve().then(() => options.resolveForward(id)));
+            }
+            const children = forwardNodes(await cache.get(id));
+            if (!children.length) { note(`${indent}  `, '内容为空或已过期'); continue; }
+            await walk(children, depth + 1);
+          } catch (error) {
+            note(`${indent}  `, String(error?.message ?? error).replace(/\s+/g, ' ').slice(0, 160));
+          } finally {
+            activeIds.delete(id);
+          }
+        }
+      }
+    } finally {
+      activeLists.delete(list);
+    }
+  }
+
+  await walk(nodes, 1);
+  let text = lines.join('\n');
+  if (stopped || text.length > maxChars) {
+    complete = false;
+    const tail = `\n…（达到${stopped || '文本长度'}上限，部分内容未展开）`;
+    text = (text.slice(0, Math.max(0, maxChars - tail.length)) + tail).slice(-maxChars);
+  }
+  return { text, media, complete, nodesRead };
+}
+
+/** 自动入库与 read_forward 共用：先从真实消息取得引用，兼容 SnowLuma 的负数消息 id。 */
+export async function readForwardMessage(onebot, messageId, options = {}) {
+  const limits = forwardLimits(options);
+  // 整次读取共享 30 秒网络预算，避免多层记录把入库/工具调用拖延数分钟。
+  const deadline = Date.now() + 30000;
+  const call = (action, params) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('转发读取超时，可稍后重试');
+    return onebot.call(action, params, Math.min(15000, remaining));
+  };
+  let segments = options.segments;
+  if (!Array.isArray(segments)) {
+    try {
+      const message = await call('get_msg', { message_id: Number(messageId) });
+      segments = forwardSegments(message?.message ?? message?.data?.message);
+    } catch { /* 较老的协议端可能没有缓存原消息，沿用 message_id 查询 */ }
+  }
+  const rootId = (segments || []).filter((s) => s?.type === 'forward')
+    .map((s) => forwardIdFromData(s.data)).find(Boolean);
+  const result = await call('get_forward_msg', rootId ? { id: rootId } : { message_id: Number(messageId) });
+  const expanded = await expandForwardNodes(forwardNodes(result), {
+    ...limits,
+    rootId,
+    resolveForward: (id) => call('get_forward_msg', { id })
+  });
+  if (!expanded) return null;
+  return { ...expanded, forwardRead: { version: 1, complete: expanded.complete, ...limits } };
 }

@@ -64,6 +64,8 @@ sandbox.globalThis = sandbox;
 const { TIER_SLIDER_BANDS, sliderToTier, tierToSlider } = await import('../src/tier-slider.js');
 const { matchPriceTable } = await import('../src/model-prices.js');
 Object.assign(sandbox, { TIER_SLIDER_BANDS, sliderToTier, tierToSlider, matchPriceTable });
+const { modelPriceKey, findCustomPrice } = await import('../ui/vendor/price-match.js');
+Object.assign(sandbox, { modelPriceKey, findCustomPrice });
 for (const n of importedNames) if (!(n in sandbox)) sandbox[n] = undefined;
 
 // app.js 是 ES module，vm 跑不了 import —— 把 export 去掉后当普通脚本执行

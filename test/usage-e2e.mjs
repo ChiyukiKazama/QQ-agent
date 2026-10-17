@@ -110,6 +110,8 @@ sandbox.globalThis = sandbox;
 const { TIER_SLIDER_BANDS, sliderToTier, tierToSlider } = await import('../src/tier-slider.js');
 const { matchPriceTable } = await import('../src/model-prices.js');
 Object.assign(sandbox, { TIER_SLIDER_BANDS, sliderToTier, tierToSlider, matchPriceTable });
+const { modelPriceKey, findCustomPrice } = await import('../ui/vendor/price-match.js');
+Object.assign(sandbox, { modelPriceKey, findCustomPrice });
 
 // 按浏览器 defer 顺序拼接 12 段普通脚本后 vm 执行（桥的 import 由上面的注入顶替）。
 const ctx = vm.createContext(sandbox);

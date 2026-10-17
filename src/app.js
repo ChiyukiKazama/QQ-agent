@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR } from './config.js';
-import { OneBotClient, segmentsToText, extractMediaFromSegments, expandForwardNodes } from './onebot.js';
+import { OneBotClient, segmentsToText, extractMediaFromSegments, readForwardMessage } from './onebot.js';
 import { isAtMe } from './prompt.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -18,12 +18,13 @@ import { Orchestrator } from './orchestrator.js';
 import { ReminderStore } from './reminders.js';
 import { VideoReader } from './video-reader.js';
 import { cacheHitRate } from './llm.js';
-import { isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
+import { isPeakHour, priceAt, resolveModelPrice, pricingSignature, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed } from './price-feed.js';
 import { startTelemetryLoop } from './telemetry.js';
 import { loadPlugins, watchPlugins } from './plugin-loader.js';
 import { skillManager } from './skills/manager.js';
 import { extractCandidateUrls, dispatchMediaLinks } from './media-links.js';
+import { MessageCommandDispatcher } from './message-commands.js';
 import { createRoutes } from './routes.js';
 import * as instanceLockModule from './instance-lock.js';
 import { logger } from './logger.js';
@@ -646,6 +647,11 @@ export function createApp({ log = console.log } = {}) {
   const reminders = new ReminderStore();
   const videoReader = new VideoReader(onebot);
   const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, reminders, videoReader });
+  const messageCommands = new MessageCommandDispatcher({
+    getProviders: ctx => skillManager.getCapabilityProviders('message.command', ctx),
+    canRun: (skillId, ctx) => !orchestrator.paused && !orchestrator.aborted && skillManager.isActive(skillId, ctx).active,
+    store, sender, sessions, emit, log
+  });
 
   // 远程价格表固定为官网公开地址；不从用户配置读取，避免被页面/配置篡改。
   initPriceFeed(FIXED_PRICE_FEED_URL);
@@ -854,17 +860,16 @@ export function createApp({ log = console.log } = {}) {
     }
 
     // 合并转发：占位符 → 展开真实内容（模型要读懂、看懂转发的聊天记录）
-    // 实测结论（2026-09-05，SnowLuma/NapCat）：get_forward_msg 只认 message_id；
-    // res_id（转发卡片里那个 id）会过期，报 "payload is empty"。
+    // 从真实消息段取得转发引用，再递归读取内层引用；不要把 QQ 消息 id 当成 res_id。
     // 媒体里的 url 此时是新鲜的，一并收进 media（取图/金句都能用）。
     // 展开失败时占位符留在存档里，模型可用 read_forward 工具稍后重试。
+    let forwardRead = null;
     if (segments && (text.includes('[合并转发') || text.includes('[转发消息')) && event.message_id != null) {
       try {
-        const r = await onebot.call('get_forward_msg', { message_id: Number(event.message_id) });
-        const nodes = Array.isArray(r?.messages) ? r.messages : (Array.isArray(r?.data?.messages) ? r.data.messages : []);
-        const ex = await expandForwardNodes(nodes);
+        const ex = await readForwardMessage(onebot, event.message_id, { ...cfgNow.store?.forward, segments });
         if (ex && ex.text) {
           text = ex.text;
+          forwardRead = ex.forwardRead;
           if (ex.media?.length) media.push(...ex.media);
         }
       } catch (e) {
@@ -906,9 +911,21 @@ export function createApp({ log = console.log } = {}) {
       text: text || '[图片]' ,
       media,
       atMe,
-      atNames
+      atNames,
+      forwardRead
     });
     emit('chat-update', `${kind}:${id}`);
+    // 确定性插件命令先消费本条消息；采集/发送在后台，不进入模型触发批。
+    const command = messageCommands.handle({
+      chatKey: `${kind}:${id}`, kind, chatId: id, entry, segments,
+      botName: cfgNow.persona?.botName || '',
+      selfNickname: onebot.selfNickname || cfgNow.persona?.selfNickname || '',
+      selfId: selfIdNow
+    });
+    if (command.handled) {
+      command.completion.catch(error => log(`[command] 处理出错：${error?.message ?? error}`));
+      return;
+    }
     // 逐条触发判定：把刚入库的条目交给编排器（entry 让它能精确标这一条已读）
     orchestrator.onIncoming(`${kind}:${id}`, entry);
 
@@ -1934,16 +1951,14 @@ async function collectUsageRows({ range }) {
 // 复用 mtime 相同的旧解析结果，增量代价很小）。"今天"永远不进快照。
 //
 // ⚠️ 成本口径：快照存 costOfRows 聚合结果。价格表（自定义价/远程价）变化
-//    会让历史成本跟着变 —— 快照固定的是"生成当时的计价"。这是刻意取舍：
-//    量级收益（秒→毫秒）远大于"改价后历史成本不联动"的小误差；想重算
-//    任何一天，删掉快照文件对应条目即可。
+//    会让历史成本跟着变；用计价签名校验，价格变化时仅重算一次，之后继续复用。
 const USAGE_DAILY_FILE = path.join(DATA_DIR, 'usage-daily.json');
 const USAGE_DAILY_VERSION = 1;
 
 function loadUsageDaily() {
   try {
     const parsed = JSON.parse(fs.readFileSync(USAGE_DAILY_FILE, 'utf8'));
-    if (parsed?.version === USAGE_DAILY_VERSION && parsed.days && typeof parsed.days === 'object') {
+    if (parsed?.version === USAGE_DAILY_VERSION && parsed.pricingSignature === pricingSignature(getConfig()) && parsed.days && typeof parsed.days === 'object') {
       return parsed.days;
     }
   } catch { /* 无文件/坏文件 = 全部重算 */ }
@@ -1954,7 +1969,7 @@ function saveUsageDaily(days) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const tmp = `${USAGE_DAILY_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ version: USAGE_DAILY_VERSION, savedAt: Date.now(), days }, null, 1), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify({ version: USAGE_DAILY_VERSION, pricingSignature: pricingSignature(getConfig()), savedAt: Date.now(), days }, null, 1), 'utf8');
     fs.renameSync(tmp, USAGE_DAILY_FILE);
   } catch { /* 快照写失败只是慢一点，绝不能影响统计主流程 */ }
 }
@@ -1981,7 +1996,7 @@ function usageDayFile(dayKey) {
 function loadUsageDayFile(dayKey) {
   try {
     const parsed = JSON.parse(fs.readFileSync(usageDayFile(dayKey), 'utf8'));
-    if (parsed?.version === USAGE_DAY_VERSION && parsed.day === dayKey && parsed.aggregates) {
+    if (parsed?.version === USAGE_DAY_VERSION && parsed.day === dayKey && parsed.pricingSignature === pricingSignature(getConfig()) && parsed.aggregates) {
       return parsed.aggregates;
     }
   } catch { /* 缺失/损坏 → 回算 */ }
@@ -2004,7 +2019,7 @@ function saveUsageDayFile(dayKey, aggregates) {
     fs.mkdirSync(USAGE_DAYS_DIR, { recursive: true });
     const tmp = `${usageDayFile(dayKey)}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({
-      version: USAGE_DAY_VERSION, day: dayKey, savedAt: Date.now(), aggregates
+      version: USAGE_DAY_VERSION, day: dayKey, pricingSignature: pricingSignature(getConfig()), savedAt: Date.now(), aggregates
     }, null, 1), 'utf8');
     fs.renameSync(tmp, usageDayFile(dayKey));
   } catch { /* 写失败只是下次再算，不影响主流程 */ }
@@ -2194,7 +2209,11 @@ async function buildUsageStatsWithSnapshots({ range = '7' } = {}) {
     for (const groups of groupsList) {
       for (const g of groups || []) {
         const key = String(g.key ?? '');
-        if (!map.has(key)) map.set(key, { key, ...g, runs: 0, exactCalls: 0, cost: 0 });
+        if (!map.has(key)) map.set(key, {
+          key, ...g, runs: 0, exactCalls: 0, cost: 0, peakCost: 0, offPeakCost: 0,
+          peakTokens: 0, offPeakTokens: 0, promptTokens: 0, completionTokens: 0,
+          cachedTokens: 0, totalTokens: 0
+        });
         const t = map.get(key);
         t.cost += Number(g.cost) || 0;
         t.peakCost += Number(g.peakCost) || 0;
@@ -2207,9 +2226,14 @@ async function buildUsageStatsWithSnapshots({ range = '7' } = {}) {
         t.totalTokens += Number(g.totalTokens) || 0;
         t.runs += Number(g.runs) || 0;
         t.exactCalls += Number(g.exactCalls) || 0;
+        t.hasPeakModel = Boolean(t.hasPeakModel || g.hasPeakModel);
       }
     }
     let out = [...map.values()];
+    for (const g of out) {
+      g.cacheHitRate = g.promptTokens ? Math.min(1, g.cachedTokens / g.promptTokens) : 0;
+      g.peakRatio = g.totalTokens ? g.peakTokens / g.totalTokens : 0;
+    }
     out.sort((a, b) => b.cost - a.cost || b.totalTokens - a.totalTokens);
     return out;
   };
@@ -2283,12 +2307,7 @@ async function buildUsageStatsWithSnapshots({ range = '7' } = {}) {
  */
 function priceOf(model, vendor) {
   const cfg = getConfig();
-  if (vendor) {
-    const byVendor = resolveModelPrice(modelLabel(vendor, model), cfg);
-    // 命中自定义价才算数；否则退回通用价（避免渠道名干扰官方表匹配）
-    if (byVendor.source === 'custom') return byVendor;
-  }
-  return resolveModelPrice(model, cfg);
+  return resolveModelPrice(vendor ? modelLabel(vendor, model) : model, cfg);
 }
 
 /** 对一批行计价，返回总额与峰谷拆分。 */
@@ -2416,6 +2435,7 @@ function tryBreakdownFromDayFiles({ range, dim, key, by }) {
   const aggs = [];
   for (const dayKey of wantedDays) {
     const agg = loadUsageDayFile(dayKey);
+    if (!agg && fs.existsSync(usageDayFile(dayKey))) return null;
     if (agg) aggs.push({ day: dayKey, aggregates: agg });
   }
   if (!aggs.length) return null;

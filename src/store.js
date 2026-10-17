@@ -80,7 +80,7 @@ export class ChatStore {
   }
 
   /** 追加一条收到的消息（未读）。返回写入的条目。 */
-  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [], isPoke = false, atMe = null, atNames = [] }) {
+  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [], isPoke = false, atMe = null, atNames = [], forwardRead = null }) {
     const st = this.#state(chatKey);
     const entry = {
       id: st.nextLocalId++,
@@ -103,6 +103,7 @@ export class ChatStore {
       // 防"@ 别人的名字里带关键词"误触发。空数组 = 该消息没有 @ 段。
       atNames: (Array.isArray(atNames) ? atNames : []).map((n) => String(n ?? '')).filter(Boolean).slice(0, 20)
     };
+    if (forwardRead) entry.forwardRead = structuredClone(forwardRead);
     st.messages.push(entry);
     this.#trim(st);
     saveChat(st);
@@ -274,12 +275,13 @@ export class ChatStore {
    * 用途：read_forward 工具把"合并转发占位符"永久升级成展开后的文本
    * —— 一次展开，以后谁（模型/存档页/金句）都直接读到内容。
    */
-  updateByMid(chatKey, mid, { text, appendMedia = [] } = {}) {
+  updateByMid(chatKey, mid, { text, appendMedia = [], forwardRead } = {}) {
     const st = this.#state(chatKey);
     const target = String(mid);
     const m = st.messages.find((x) => String(x.mid) === target);
     if (!m) return false;
     if (text != null) m.text = String(text);
+    if (forwardRead !== undefined) m.forwardRead = structuredClone(forwardRead);
     if (appendMedia.length) {
       m.media = Array.isArray(m.media) ? m.media : [];
       const seen = new Set(m.media.map((x) => x && x.url));

@@ -371,6 +371,26 @@ export class SendQueue {
     });
   }
 
+  /** 原生消息表情回应：复用会话串行、发送限频和去重，成功后才留档。 */
+  react(chatKey, messageId, reaction, cancel = false) {
+    const [kind, id] = String(chatKey).split(':');
+    if (kind !== 'group') return Promise.reject(new Error('表情回应仅支持群聊消息'));
+    const key = `__reaction__${messageId}:${reaction.id}`;
+    return this.#chain(chatKey)(async () => {
+      const state = `${key}:${cancel ? 'remove' : 'add'}`;
+      if (this.#isDuplicate(chatKey, state)) return { duplicate: true };
+      this.#checkRate(chatKey);
+      await this.onebot.reactToMessage(id, messageId, reaction.id, cancel);
+      // 添加、取消、再添加必须可以正常切换，不能被另一种操作的去重记录挡住。
+      this.recentSent.delete(`${chatKey}::${key}:${cancel ? 'add' : 'remove'}`);
+      this.#markSent(chatKey, state);
+      const text = `[${cancel ? '取消表情回应' : '表情回应'}] #${messageId} ${reaction.emoji}`;
+      this.store.appendSelf(chatKey, { text, ts: Date.now(), mid: null });
+      this.onSent?.({ chatKey, text, messageId: null, kind: 'reaction' });
+      return { duplicate: false };
+    });
+  }
+
   /** 拍一拍。发送成功后留档（self 记录），否则下一次运行不知道自己拍过。 */  poke(chatKey, targetUserId) {
     const [kind, id] = String(chatKey).split(':');
     const chain = this.#chain(chatKey);

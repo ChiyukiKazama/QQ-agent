@@ -5,6 +5,26 @@
 //    前端这份只对 /api/model-prices 下发的 prices 数组做本地匹配。
 //    两边匹配规则必须保持一致：精确 → 去 provider 前缀 → 最长前缀。
 
+export function modelPriceKey(vendor, model) {
+  const v = String(vendor || '').trim();
+  const m = String(model || '').trim();
+  return v ? `${v}：${m}` : m;
+}
+
+/** 显式的 0 是免费，不是“没填写”。 */
+export function hasCustomPrice(price) {
+  if (!price || typeof price !== 'object') return false;
+  const fields = ['in', 'out', 'cached'].filter(k => price[k] !== null && price[k] !== undefined && price[k] !== '');
+  return fields.length > 0 && fields.every(k => ['number', 'string'].includes(typeof price[k])
+    && Number.isFinite(Number(price[k])) && Number(price[k]) >= 0);
+}
+
+export function findCustomPrice(prices, vendor, model) {
+  const keys = [...new Set([modelPriceKey(vendor, model), String(model || '').trim()])];
+  for (const key of keys) if (hasCustomPrice(prices?.[key])) return { key, price: prices[key] };
+  return null;
+}
+
 /**
  * 在价格表（数组，元素含 id 字段）里匹配模型。
  * @param {string} modelId 模型 id（可带 provider 前缀，如 z-ai/glm-5.3）
