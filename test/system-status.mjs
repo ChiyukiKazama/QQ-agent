@@ -9,7 +9,7 @@ const { DEFAULT_CONFIG, setRuntimeConfig, DATA_DIR } = await import('../src/conf
 const { MessageCommandDispatcher } = await import('../src/message-commands.js');
 const { SendQueue } = await import('../src/sender.js');
 const { isStatusCommand, createStatusProvider } = await import('../plugins/system-status/index.js');
-const { formatSystemStatus, cpuUsage } = await import('../plugins/system-status/status.js');
+const { formatSystemStatus, cpuUsage, collectWindowsDetails } = await import('../plugins/system-status/status.js');
 const { skillManager } = await import('../src/skills/manager.js');
 const manifest = JSON.parse(fs.readFileSync(new URL('../plugins/system-status/plugin.json', import.meta.url)));
 const sample = { system: 'Windows', release: '10.0', arch: 'x64', bootTime: '2026-10-15T00:00:00Z', uptime: 172860,
@@ -85,6 +85,61 @@ test('missing metadata is explicit and CPU load uses a real interval delta', () 
   assert.ok(!text.includes('null'));
   assert.match(text, /暂不可用/);
   assert.match(text, /频率: 暂不可用/);
+});
+
+const windowsParts = [
+  { part: 'processors', data: { cpuName: sample.cpuName, cores: sample.cores, threads: sample.threads } },
+  { part: 'disks', data: { disks: sample.disks } },
+  { part: 'system', data: { system: sample.system, bootTime: sample.bootTime } },
+  { part: 'frequency', data: { cpuFrequencyMHz: sample.cpuFrequencyMHz } }
+];
+const windowsOutput = parts => parts.map(p => JSON.stringify(p)).join('\r\n') + '\r\n';
+
+test('Windows collection tolerates cold initialization beyond the former six-second limit', async () => {
+  // 模拟执行器需要 6.5 秒：用限时契约验证，不让测试实际空等。
+  const details = await collectWindowsDetails(async (exe, args, options) => {
+    if (options.timeout <= 6500) throw Object.assign(new Error('timed out'), { killed: true, stdout: '' });
+    return { stdout: '\uFEFF' + windowsOutput(windowsParts) };
+  });
+  assert.equal(details.metadataUnavailable, false);
+  assert.equal(details.cores, 4);
+  assert.equal(details.threads, 8);
+  assert.equal(details.cpuFrequencyMHz, 2531);
+  assert.deepEqual(details.disks, sample.disks);
+});
+
+test('one failed Windows query preserves unrelated metadata and records its reason', async () => {
+  for (const failedPart of ['system', 'processors', 'disks', 'frequency']) {
+    const details = await collectWindowsDetails(async () => ({ stdout: windowsOutput(windowsParts.map(p =>
+      p.part === failedPart ? { part: failedPart, error: 'CIM unavailable' } : p)) }));
+    assert.equal(details.metadataUnavailable, true);
+    assert.deepEqual(details.metadataErrors, [`${failedPart}: CIM unavailable`]);
+    if (failedPart !== 'processors') assert.equal(details.cores, 4);
+    if (failedPart !== 'disks') assert.deepEqual(details.disks, sample.disks);
+    if (failedPart !== 'frequency') assert.equal(details.cpuFrequencyMHz, 2531);
+  }
+});
+
+test('Windows process timeout retains completed parts even with a truncated final packet', async () => {
+  const details = await collectWindowsDetails(async () => {
+    throw Object.assign(new Error('timed out'), { killed: true,
+      stdout: windowsOutput(windowsParts.slice(0, 3)) + '{"part":"frequency","data":' });
+  });
+  assert.equal(details.cores, 4);
+  assert.deepEqual(details.disks, sample.disks);
+  assert.equal(details.system, sample.system);
+  assert.equal(details.cpuFrequencyMHz, undefined);
+  assert.ok(details.metadataErrors.some(e => e.includes('超时')));
+  assert.ok(details.metadataErrors.some(e => e.includes('frequency')));
+});
+
+test('Windows executable failure reports diagnostics rather than inventing hardware values', async () => {
+  const details = await collectWindowsDetails(async () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); });
+  assert.equal(details.metadataUnavailable, true);
+  assert.equal(details.cores, undefined);
+  assert.equal(details.cpuFrequencyMHz, undefined);
+  assert.deepEqual(details.disks, []);
+  assert.ok(details.metadataErrors.includes('ENOENT'));
 });
 
 test('command is consumed synchronously and sent through the normal queue with zero LLM calls', async () => {

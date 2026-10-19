@@ -8,37 +8,87 @@ const execFileAsync = promisify(execFile);
 // 固定只读查询；不接受来自消息的命令、脚本、路径或额外参数。
 const WINDOWS_QUERY = `
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$system = Get-CimInstance Win32_OperatingSystem -Property Caption,LastBootUpTime
-$processors = @(Get-CimInstance Win32_Processor -Property Name,NumberOfCores,NumberOfLogicalProcessors)
-$volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -Property DeviceID,FileSystem,Size,FreeSpace)
-$frequencyMHz = $null
-try {
+function Write-StatusPart([string]$part, [scriptblock]$read) {
+  try {
+    $data = & $read
+    [pscustomobject]@{ part = $part; data = $data } | ConvertTo-Json -Depth 5 -Compress
+  } catch {
+    [pscustomobject]@{ part = $part; error = $_.Exception.Message } | ConvertTo-Json -Depth 5 -Compress
+  }
+  [Console]::Out.Flush()
+}
+# 各项独立输出；后面的查询超时或失败时，已经取得的数据仍可使用。
+Write-StatusPart 'processors' {
+  $processors = @(Get-CimInstance Win32_Processor -Property Name,NumberOfCores,NumberOfLogicalProcessors -OperationTimeoutSec 5)
+  [pscustomobject]@{
+    cpuName = (($processors | Select-Object -ExpandProperty Name -Unique) -join ' / ')
+    cores = ($processors | Measure-Object -Property NumberOfCores -Sum).Sum
+    threads = ($processors | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+  }
+}
+Write-StatusPart 'disks' {
+  $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -Property DeviceID,FileSystem,Size,FreeSpace -OperationTimeoutSec 5)
+  [pscustomobject]@{
+    disks = @($volumes | Where-Object { $_.Size -gt 0 } | Sort-Object DeviceID | ForEach-Object {
+      [pscustomobject]@{ name = $_.DeviceID; fileSystem = $_.FileSystem; total = $_.Size; free = $_.FreeSpace }
+    })
+  }
+}
+Write-StatusPart 'system' {
+  $system = Get-CimInstance Win32_OperatingSystem -Property Caption,LastBootUpTime -OperationTimeoutSec 5
+  [pscustomobject]@{
+    system = $system.Caption
+    bootTime = $system.LastBootUpTime.ToUniversalTime().ToString('o')
+  }
+}
+Write-StatusPart 'frequency' {
   # 整体实际频率；ProcessorFrequency 在现代调频 CPU 上可能偏离实际速度。
-  $performance = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -Property ActualFrequency
-  if ($performance.ActualFrequency -gt 0) { $frequencyMHz = $performance.ActualFrequency }
-} catch { }
-[pscustomobject]@{
-  system = $system.Caption
-  bootTime = $system.LastBootUpTime.ToUniversalTime().ToString('o')
-  cpuName = (($processors | Select-Object -ExpandProperty Name -Unique) -join ' / ')
-  cores = ($processors | Measure-Object -Property NumberOfCores -Sum).Sum
-  threads = ($processors | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-  cpuFrequencyMHz = $frequencyMHz
-  disks = @($volumes | Where-Object { $_.Size -gt 0 } | Sort-Object DeviceID | ForEach-Object {
-    [pscustomobject]@{ name = $_.DeviceID; fileSystem = $_.FileSystem; total = $_.Size; free = $_.FreeSpace }
-  })
-} | ConvertTo-Json -Depth 4 -Compress
+  $performance = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -Property ActualFrequency -OperationTimeoutSec 5
+  if ($performance.ActualFrequency -le 0) { throw 'ActualFrequency 未返回有效的整体实际频率' }
+  [pscustomobject]@{ cpuFrequencyMHz = $performance.ActualFrequency }
+}
 `;
+
+export async function collectWindowsDetails(run = execFileAsync) {
+  const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const options = { windowsHide: true, timeout: 15000, maxBuffer: 256 * 1024, encoding: 'utf8' };
+  let stdout = '', processError = '';
+  try {
+    ({ stdout } = await run(executable, ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_QUERY], options));
+  } catch (error) {
+    // execFile 超时也会带回已经输出的完整分项，不能把它们一并丢掉。
+    stdout = error.stdout || '';
+    processError = error.killed ? `Windows 采集超时（${options.timeout}ms）` : String(error.code || error.message);
+  }
+  const fields = { processors: ['cpuName', 'cores', 'threads'], disks: ['disks'], system: ['system', 'bootTime'], frequency: ['cpuFrequencyMHz'] };
+  const result = { disks: [], metadataErrors: [] }, received = new Set();
+  for (const line of String(stdout).replace(/^\uFEFF/, '').split(/\r?\n/).filter(s => s.trim())) {
+    try {
+      const packet = JSON.parse(line);
+      if (!Object.hasOwn(fields, packet.part)) continue;
+      received.add(packet.part);
+      if (packet.error) result.metadataErrors.push(`${packet.part}: ${packet.error}`);
+      else if (packet.data && typeof packet.data === 'object') {
+        for (const field of fields[packet.part]) if (Object.hasOwn(packet.data, field)) result[field] = packet.data[field];
+      } else result.metadataErrors.push(`${packet.part}: 未返回有效数据`);
+    } catch {
+      result.metadataErrors.push('Windows 采集输出包含不完整或无效的 JSON');
+    }
+  }
+  if (processError) result.metadataErrors.push(processError);
+  for (const part of Object.keys(fields)) if (!received.has(part)) result.metadataErrors.push(`${part}: 未返回结果`);
+  result.disks = Array.isArray(result.disks) ? result.disks : [];
+  result.metadataUnavailable = result.metadataErrors.length > 0;
+  return result;
+}
 
 async function platformDetails() {
   if (process.platform === 'win32') {
-    const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    const { stdout } = await execFileAsync(executable, ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_QUERY], {
-      windowsHide: true, timeout: 6000, maxBuffer: 256 * 1024, encoding: 'utf8'
-    });
-    const result = JSON.parse(stdout.replace(/^\uFEFF/, '').trim());
-    return { ...result, disks: Array.isArray(result.disks) ? result.disks : [] };
+    const result = await collectWindowsDetails();
+    if (result.metadataUnavailable) console.warn('[system-status] ' + result.metadataErrors.join('; '));
+    return result;
   }
   const disk = await statfs('/');
   return { disks: [{ name: '/', total: disk.blocks * disk.bsize, free: disk.bfree * disk.bsize }] };
@@ -66,7 +116,10 @@ export function collectSystemStatus() {
 
 async function collect() {
   const before = cpuTimes();
-  const metadata = platformDetails().catch(() => ({ disks: [], metadataUnavailable: true }));
+  const metadata = platformDetails().catch(error => {
+    console.warn('[system-status] 采集失败: ' + error.message);
+    return { disks: [], metadataUnavailable: true, metadataErrors: [error.message] };
+  });
   await new Promise(resolve => setTimeout(resolve, 500));
   const usage = cpuUsage(before, cpuTimes());
   const details = await metadata;
@@ -80,7 +133,7 @@ async function collect() {
     cores: Number(details.cores) || null, threads: Number(details.threads) || os.cpus().length,
     cpuPercent: usage, cpuFrequencyMHz: Number(details.cpuFrequencyMHz) > 0 ? Number(details.cpuFrequencyMHz) : null,
     memory: { total, used }, disks: details.disks,
-    metadataUnavailable: details.metadataUnavailable === true
+    metadataUnavailable: details.metadataUnavailable === true, metadataErrors: details.metadataErrors || []
   };
 }
 
