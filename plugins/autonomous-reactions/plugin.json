@@ -1,0 +1,11 @@
+{
+  "id": "autonomous-reactions",
+  "name": "自主表情回应",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "description": "沿用现有回应频率，在普通群聊处理机会中优先考虑用消息下方的小表情轻量参与。",
+  "enabledByDefault": true,
+  "entry": "index.js",
+  "capabilities": []
+}

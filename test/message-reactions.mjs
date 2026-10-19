@@ -7,10 +7,16 @@ import { buildToolDefs } from '../src/tools.js';
 import { buildSystemPrompt, resolveContextTier } from '../src/prompt.js';
 import { getToolAvailability } from '../src/tool-registry.js';
 import { resolveMessageReaction } from '../src/reactions.js';
+import { skillManager } from '../src/skills/manager.js';
+import * as autonomous from '../plugins/autonomous-reactions/index.js';
 
 const definitions = buildToolDefs();
 const tool = definitions.find(t => t.id === 'send_reaction');
-beforeEach(() => setRuntimeConfig(structuredClone(DEFAULT_CONFIG)));
+beforeEach(() => {
+  setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+  autonomous.dispose();
+  skillManager.unregister('autonomous-reactions');
+});
 function context({ fail = false, self = false } = {}) {
   const calls = [], records = [], events = [];
   const entry = { mid: -123, self };
@@ -113,4 +119,72 @@ test('reaction support does not bypass the existing response frequency tier', ()
   const base = { triggerEntries: [{ text: '普通聊天', atMe: false }], botName: '化海月', selfId: '123', isPrivate: false, cfg: { contextTier: 1, historyCount: 80 } };
   assert.equal(resolveContextTier(base).shouldRespond, false);
   assert.equal(resolveContextTier({ ...base, cfg: { ...base.cfg, contextTier: 4 } }).shouldRespond, true);
+});
+
+test('ordinary group opportunities get a concrete reaction hint without changing the system prefix', () => {
+  const ctx = { kind: 'group', sessionId: 'ordinary', triggerEntries: [
+    { mid: -123, atMe: false }, { mid: 456, atMe: false }
+  ], messages: [{ role: 'system', content: 'original system' }, { role: 'user', content: 'original history' }] };
+  autonomous.hooks['before-context'](ctx);
+  autonomous.hooks['before-llm-messages'](ctx);
+  assert.equal(ctx.messages.length, 3);
+  assert.deepEqual(ctx.messages[0], { role: 'system', content: 'original system' });
+  assert.match(ctx.messages[2].content, /#-123、#456/);
+  assert.match(ctx.messages[2].content, /send_reaction/);
+  autonomous.hooks['before-llm-messages'](ctx);
+  assert.equal(ctx.messages.length, 3); // 消费一次，不残留到下次模型请求。
+});
+
+test('direct summons, private chats and proactive runs retain their normal response path', () => {
+  for (const patch of [ { triggerEntries: [{ mid: 1, atMe: true }] },
+    { triggerEntries: [{ mid: 1, isPoke: true }] }, { kind: 'private' }, { proactive: true } ]) {
+    const ctx = { kind: 'group', sessionId: 'skip', triggerEntries: [{ mid: -123, atMe: false }], messages: [], ...patch };
+    autonomous.hooks['before-context'](ctx);
+    autonomous.hooks['before-llm-messages'](ctx);
+    assert.equal(ctx.messages.length, 0);
+  }
+});
+
+test('reaction candidates exclude self, recalled and invalid IDs and stay bound to their session', () => {
+  const ctx = { kind: 'group', sessionId: 'a', messages: [], triggerEntries: [
+    { mid: -123 }, { mid: -123 }, { mid: 555, self: true }, { mid: 666, recalled: true },
+    { mid: 0 }, { mid: 'invented' }, { mid: '9007199254740993' }
+  ] };
+  autonomous.hooks['before-context'](ctx);
+  const other = { kind: 'group', sessionId: 'b', messages: [] };
+  autonomous.hooks['before-llm-messages'](other);
+  assert.equal(other.messages.length, 0);
+  autonomous.hooks['before-llm-messages'](ctx);
+  assert.match(ctx.messages[0].content, /#-123/);
+  assert.ok(!/#555|#666|#0|invented|9007199254740993/.test(ctx.messages[0].content));
+});
+
+test('disabled reaction tools suppress both plugin guidance and pending hints', () => {
+  for (const patch of [{ enabled: false }, { categories: { messaging: false } }, { overrides: { send_reaction: false } }]) {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    const ctx = { kind: 'group', sessionId: 'disabled', triggerEntries: [{ mid: -123 }], messages: [] };
+    autonomous.hooks['before-context'](ctx);
+    cfg.tools = { ...cfg.tools, ...patch }; setRuntimeConfig(cfg);
+    assert.equal(autonomous.available(ctx).ok, false);
+    autonomous.hooks['before-llm-messages'](ctx);
+    assert.equal(ctx.messages.length, 0);
+    setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+  }
+});
+
+test('plugin enable and disable control the real prompt and hook registry together', async () => {
+  const manifest = { id: 'autonomous-reactions', name: '自主表情回应', version: '1.0.0', enabledByDefault: true };
+  skillManager.register({ manifest, kind: 'plugin', ...autonomous });
+  const ctx = { kind: 'group', sessionId: 'registry', triggerEntries: [{ mid: -123 }], messages: [] };
+  assert.ok(buildSystemPrompt({ skillContext: ctx }).includes(autonomous.REACTION_GUIDANCE));
+  await skillManager.runHook('before-context', ctx);
+  await skillManager.runHook('before-llm-messages', ctx);
+  assert.equal(ctx.messages.length, 1);
+  const cfg = structuredClone(DEFAULT_CONFIG); cfg.skills['autonomous-reactions'] = { enabled: false }; setRuntimeConfig(cfg);
+  assert.ok(!buildSystemPrompt({ skillContext: ctx }).includes(autonomous.REACTION_GUIDANCE));
+  ctx.messages = [];
+  await skillManager.runHook('before-context', ctx);
+  await skillManager.runHook('before-llm-messages', ctx);
+  assert.equal(ctx.messages.length, 0);
+  skillManager.unregister('autonomous-reactions');
 });
