@@ -5,6 +5,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { startAudioCleanup } from './audio.js';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR } from './config.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments, readForwardMessage } from './onebot.js';
@@ -645,6 +646,7 @@ export function createApp({ log = console.log } = {}) {
     log
   });
   const reminders = new ReminderStore();
+  const stopAudioCleanup = startAudioCleanup(log);
   const videoReader = new VideoReader(onebot);
   const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, reminders, videoReader });
   const messageCommands = new MessageCommandDispatcher({
@@ -1305,7 +1307,7 @@ export function createApp({ log = console.log } = {}) {
   // 声明式路由表（src/routes.js）：把所有依赖一次性注入。
   // 路由 handler 通过闭包取用这些依赖，handleHttp 只负责匹配分发。
   const apiRoutes = createRoutes({
-    store, memory, sessions, onebot, orchestrator,
+    store, memory, sessions, onebot, orchestrator, sender,
     emit, log,
     localVersion, compareSemver, UPDATE_INFO_URL,
     sanitizeConfig, keyEndpointAllowed, sanitizeProvider,
@@ -1661,6 +1663,7 @@ export function createApp({ log = console.log } = {}) {
     // 索引缓存立刻落盘：正常运行中靠防抖（5s），退出前必须写一次，
     // 否则最后的会话变动丢失、下次启动要靠后台对账补（慢路径）
     sessions.flushIndexCache();
+    stopAudioCleanup();
     // 关闭所有 SSE 长连接，避免 server.close() 一直等它们
     for (const c of [...sseClients]) {
       try { c.end(); } catch { /* ignore */ }

@@ -140,7 +140,7 @@ const ctx = vm.createContext(sandbox);
   const sections = [
     'renderSettingsSection', 'renderApiSection', 'renderSearchSection',
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
-    'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
+    'renderChatSection', 'renderAudioSection', 'renderDesktopSection', 'renderOnebotSection',
     'renderPersonaPicker', 'renderHealthCard', 'renderSkillsPage', 'renderPluginsPage'
   ];
 
@@ -291,6 +291,13 @@ const ctx = vm.createContext(sandbox);
   }
 
   // 各滑条位置都渲染一次（覆盖全区间）
+  for (const threshold of [undefined, 0, 1234]) {
+    const out = ctx.renderChatSection({ ...cfg, send: { ...cfg.send, forwardThreshold: threshold } });
+    const ok = out.includes('id="sc-forward-threshold"') &&
+      out.includes(`value="${threshold ?? 800}"`);
+    ok ? pass++ : fail++;
+    console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + ' 合并转发阈值渲染：' + String(threshold ?? '默认800'));
+  }
   console.log('\n=== 各滑条位置渲染聊天设置 ===');
   for (const pos of [0, 5, 10, 15, 20, 30, 55, 75, 90, 95, 100]) {
     try {

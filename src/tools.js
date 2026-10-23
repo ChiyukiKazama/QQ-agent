@@ -7,6 +7,7 @@
 // 重构说明：所有工具通过 registerTool() 注册到 tool-registry.js，
 // 支持在设置页按卡片勾选启用/禁用。
 import { getConfig } from './config.js';
+import { registerAudioTools } from './audio-tools.js';
 import fs from 'node:fs';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
@@ -175,11 +176,12 @@ function loadPluginTools() {
 
 /** 注册所有内置工具到 registry。 */
 function registerAllTools() {
+  registerAudioTools();
   // 消息发送类
   registerTool({
     id: 'send_message',
     name: '发送消息',
-    description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊；要发到别处用 send_to）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
+    description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊；要发到别处用 send_to）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。同一段回复的多条文本应放在一次调用的 messages 数组中；总字数超过管理员设置的阈值时，发送器会自动合并转发，减少连续发言。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
     category: 'messaging',
     icon: '💬',
     parameters: {

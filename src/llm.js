@@ -105,6 +105,31 @@ function specializedModelFor(messages, cfg) {
   return '';
 }
 
+/** 专用模型绑定整个渠道身份；旧版仅模型 ID 的配置保持原端点语义。 */
+function specializedTargetFor(messages, cfg) {
+  const model = specializedModelFor(messages, cfg);
+  if (!model) return null;
+  const hasVideo = messages.some(m => Array.isArray(m?.content) && m.content.some(part => part?.type === 'video_url'));
+  const field = hasVideo && String(cfg.api?.videoModel || '').trim() ? 'videoProvider' : 'visionProvider';
+  const provider = String(cfg.api?.[field] || '').trim();
+  if (!provider) return { model };
+  const matches = (cfg.providers || []).filter(p => p.id === provider);
+  if (matches.length !== 1) throw new Error('专用模型指定的渠道不存在或身份重复，请重新选择');
+  const entry = matches[0];
+  const baseUrl = String(entry.baseURL || entry.baseUrl || '').trim();
+  let endpoint;
+  try { endpoint = new URL(baseUrl); } catch { throw new Error('专用模型渠道地址无效，请重新配置'); }
+  if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    throw new Error('专用模型渠道地址无效，请重新配置');
+  }
+  if (entry.baseURL && entry.baseUrl && entry.baseURL.trim().replace(/\/+$/, '') !== entry.baseUrl.trim().replace(/\/+$/, '')) {
+    throw new Error('专用模型渠道地址别名冲突，请重新配置');
+  }
+  // 清空手动主模型 Key 的回退，专用渠道没有 Key 时不能借用另一个渠道的凭据。
+  const apiKey = resolveApiKey({ ...cfg, api: { ...cfg.api, provider, apiKey: '' } });
+  return { model, provider, baseUrl, apiKey };
+}
+
 /**
  * 解析某个提供商 id 对应的 { baseUrl, apiKey }。
  * 用于备选模型跨提供商切换：备选项指定了 provider 时，要用那个提供商的
@@ -226,7 +251,7 @@ export async function chatCompletionWithRetry(args, retries = 2) {
         r._usedModel = r.model || (overrides?.model ?? getConfig().api?.model ?? '');
         // 把"这次实际用的端点"一并带回去：备选模型可能来自**另一个 provider**，
         // 调用方要据此同步 vendor，否则成本看板的「渠道：模型」聚合会串味。
-        r._usedApi = overrides ?? getConfig().api;
+        r._usedApi ??= overrides ?? getConfig().api;
         return r;
       } catch (error) {
         lastError = error;
@@ -271,11 +296,12 @@ export async function chatCompletion({ messages, tools = null, toolChoice = 'aut
   let api = baseApi;
   let poolAccountId = '';
   if (!overrides) {
+    const target = specializedTargetFor(messages, getConfig());
     // ── 账号池（account-pool Skill）：在主调用路径上挑一个端点 ──
     // 每次真实请求都重新挑，所以多轮对话里自然轮转，而不是"整轮锁死一个端点"。
     // 池子为空 / 全部冷却时返回 null，行为与没有这个 Skill 时完全一致。
     // 备选模型降级路径（overrides 非空）刻意**不**走池：那些候选是用户显式排队指定的。
-    try {
+    if (!target?.provider) try {
       for (const p of skillManager.getCapabilityProviders('llm.endpoint-pick', {})) {
         const picked = p.fn({ model: baseApi.model });
         if (picked?.baseUrl) {
@@ -292,8 +318,8 @@ export async function chatCompletion({ messages, tools = null, toolChoice = 'aut
     } catch (error) {
       skillManager.recordError('account-pool', error);
     }
-    const forced = specializedModelFor(messages, getConfig());
-    if (forced && forced !== api.model) api = { ...api, model: forced };
+    // 显式专用渠道不经过主模型账号池；仅模型 ID 的旧配置仍可复用原账号池。
+    if (target) api = { ...api, ...target };
   }
   const ctx = skillContext || { api, model: api.model, messages };
 
@@ -482,6 +508,8 @@ export async function chatCompletion({ messages, tools = null, toolChoice = 'aut
 
   // 响应加工：内置思考提取 + Skill 转换器（提取 reasoning、补统计等），错误隔离 + 串行。
   await applyResultTransforms(result, ctx);
+  // 计价/留档跟随真正使用的渠道；回执不携带密钥。
+  result._usedApi = { baseUrl: api.baseUrl, provider: api.provider || '', model: api.model };
   // 回报账号池：这次用了哪个端点、耗时多少（用于动态调权）
   if (poolAccountId) {
     reportPoolFeedback({ accountId: poolAccountId, ok: true, latencyMs: Date.now() - startedAt });

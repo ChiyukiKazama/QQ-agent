@@ -9,7 +9,8 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-agent-customizations-'));
 const suites = {
   FORWARD: 'nested-forward', STICKER: 'sticker-unify', REACTION: 'message-reactions',
-  PRICING: 'channel-pricing', PROMPT: 'prompt-cache', STATUS: 'system-status'
+  PRICING: 'channel-pricing', PROMPT: 'prompt-cache', STATUS: 'system-status',
+  FORWARD_SEND: 'message-forward', AUDIO: 'audio', UPSTREAM: 'upstream-batch1'
 };
 const env = { ...process.env, QQ_AGENT_DATA_DIR: path.join(dataRoot, 'default') };
 for (const [key, name] of Object.entries(suites)) env[`QQ_AGENT_${key}_TEST_DIR`] = path.join(dataRoot, name);

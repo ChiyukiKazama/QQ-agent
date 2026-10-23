@@ -11,6 +11,7 @@
 // 路由 handler 通过闭包取用，避免在 app.js 里反复传参。
 
 import fs from 'node:fs';
+import { createAudioRoutes } from './audio-routes.js';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { getConfig, updateConfig, deepMerge as deepMergeConfig, DATA_DIR } from './config.js';
@@ -84,6 +85,7 @@ export function createRoutes(deps) {
   };
 
   return [
+    ...createAudioRoutes(deps),
     // ── 状态 / 数据目录 / 重置 ─────────────────────────────────────────
     {
       method: 'GET', pattern: '/api/status',

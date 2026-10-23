@@ -44,6 +44,8 @@ export const DEFAULT_CONFIG = {
     //    此前它们只是存下来给 UI 看，没有任何代码读取 —— 填了不起作用。
     visionModel: '',            // 图片输入专用模型（留空 = 用主模型）
     videoModel: '',             // 视频输入专用模型（留空 = 用主模型）
+    visionProvider: '',         // 专用模型的渠道；旧配置留空时沿用主调用端点
+    videoProvider: '',
     // 视频走哪条路。两条路**互斥**，不会同时喂 ——
     // 同时喂等于同一内容重复计费，而且多数网关会因格式冲突直接 400。
     //   auto   配了 videoModel 就认为你有全模态模型 → 原生读视频；否则抽帧；
@@ -201,6 +203,14 @@ export const DEFAULT_CONFIG = {
   allow: { groups: [], private: [] },
   deny: { groups: [], private: [] },
   allowAllWhenEmpty: false,
+  // 音频库独立管理；本地模型由用户部署，本程序只调用配置好的接口。
+  audio: {
+    tts: {
+      enabled: false, provider: 'openai', baseUrl: 'http://127.0.0.1:8880/v1',
+      apiKey: '', model: '', voice: '', speed: 1,
+      refAudioPath: '', promptText: '', textLang: 'zh', promptLang: 'zh'
+    }
+  },
   // 运行节奏
   wakeDelayMs: 2000,        // 空闲时收到消息到发起运行的防抖窗口（等连发聚成一批）
   drainDelayMs: 1200,       // 一次运行结束后发现还有未读，到下一次运行的间隔
@@ -217,6 +227,7 @@ export const DEFAULT_CONFIG = {
     maxPerMinute: 80,
     maxPerHour: 500,
     hardSplitAt: 4000,      // QQ 硬限制切分（0 = 不限制）
+    forwardThreshold: 800, // 一次发送的纯文本总字数超过此值时改为合并转发；0 = 关闭
     // 发送去重窗口（毫秒）：同一会话在该窗口内完全相同的文本只发一次。
     // 防"模型重复调用 send_message / OneBot 超时看似失败但实际已发出、上层重试再发"导致的重复发言。
     // 0 = 关闭去重。默认 8000（8 秒）。

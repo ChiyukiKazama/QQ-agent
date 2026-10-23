@@ -45,6 +45,7 @@ function renderSettingsSidebar() {
     ['persona', '人设'],
     ['allow', '聊天白名单'],
     ['chat', '聊天设置'],
+    ['audio', '语音'],
     ['desktop', '桌面端'],
     ['onebot', 'OneBot（SnowLuma）'],
     ['tools', '工具与技能']
@@ -124,6 +125,7 @@ function renderSettings() {
     // 挂在 #settings-form 上的委托不受影响。放后面绑定则能找到最终结构。
     if (typeof enhanceConcept2UI === 'function') enhanceConcept2UI(box);
     bindSettingsEvents(c);
+    if (typeof bindAudioEvents === 'function') bindAudioEvents();
     if (box && prevScrollTop) box.scrollTop = prevScrollTop;
   } catch (err) {
     // 单个设置区渲染失败不能让整页空白 —— 显示错误占位，其余页签仍可用
@@ -160,6 +162,7 @@ function renderSettingsSection(c) {
     persona: () => renderPersonaSection(c),
     allow: () => renderAllowSection(c),
     chat: () => renderChatSection(c),
+    audio: () => renderAudioSection(c),
     desktop: () => renderDesktopSection(c),
     onebot: () => renderOnebotSection(c),
     tools: () => renderToolsSection(c)
@@ -882,6 +885,9 @@ return `
       <div class="field-row">
         <div class="field"><label>每分钟最多发送</label><input type="number" id="sc-maxpermin" min="1" value="${esc(c.send?.maxPerMinute ?? 80)}" /></div>
         <div class="field"><label>每小时最多发送</label><input type="number" id="sc-maxperhour" min="1" value="${esc(c.send?.maxPerHour ?? 500)}" /></div>
+      </div>
+      <div class="field"><label>合并转发字数阈值</label><input type="number" id="sc-forward-threshold" min="0" step="1" value="${esc(c.send?.forwardThreshold ?? 800)}" />
+        <div class="hint">同一次发送的文本总字数超过阈值时，自动打包成一条合并转发，减少连续发言。默认 800 字，0 = 关闭；群聊和私聊均适用。</div>
       </div>
       <div class="hint">改动即时生效（自动保存），无需单独点保存。</div>`
     })}

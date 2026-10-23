@@ -4,6 +4,8 @@
 // - Markdown → 纯文本、QQ 硬长度切分、CQ 转义
 // - 发出的每一条记进 ChatStore（self=true，供下一次运行当"自己的发言"）
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+import { assertVoiceTarget, AUDIO_MAX_BYTES } from './audio.js';
 import { getConfig, DEFAULT_CONFIG } from './config.js';
 import { sleep, randInt, createSendChain, formatClockTime } from './util.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
@@ -128,6 +130,33 @@ export class SendQueue {
     return Math.min(15000, Math.max(min, randInt(min, max) * 0.5 + byLength * 0.5));
   }
 
+  async #sendForwardBatch(chatKey, kind, id, parts, options) {
+    return this.#chain(chatKey)(async () => {
+      // 与普通文本共用去重记录；排队期间已发出的内容也要跳过。
+      // 批内相同节点仍保留：长文硬切分后可能出现相同片段，不能丢字。
+      const pending = parts.filter((text) => !this.#isDuplicate(chatKey, text));
+      if (!pending.length) {
+        return { sent: [{ text: parts.join('\n\n'), messageId: null, at: formatClockTime(), deduped: true }], failed: [] };
+      }
+      this.#checkRate(chatKey); // 整张转发卡片只占一次发送额度。
+      let data;
+      try {
+        data = await this.onebot.sendForward(kind, id, pending, options);
+      } catch (error) {
+        // 超时可能已经发出；不拆成普通消息重发，避免重复发言和再次触发限频。
+        throw new Error(`合并转发发送失败：${error?.message ?? error}（未自动拆发）`);
+      }
+      for (const text of pending) this.#markSent(chatKey, text);
+      const text = `[合并转发聊天记录]\n${pending.join('\n\n')}`;
+      const ts = Date.now();
+      const messageId = data?.message_id ?? null;
+      this.store.appendSelf(chatKey, { text, ts, mid: messageId });
+      this.onSent?.({ chatKey, text, messageId });
+      this.log?.(`[sender] ${pending.length} 条文本已合并转发到 ${chatKey}`);
+      return { sent: [{ text, messageId, at: formatClockTime(ts), forwarded: true, nodeCount: pending.length }], failed: [] };
+    });
+  }
+
   /**
    * 发送一批文本消息（一条或多条）。
    * options: { replyToMessageId, atUserId }
@@ -138,7 +167,13 @@ export class SendQueue {
     if (kind !== 'group' && kind !== 'private') throw new Error(`非法会话 key：${chatKey}`);
     const list = Array.isArray(messages) ? messages : [messages];
     if (!list.length) throw new Error('消息列表为空');
-    const hardSplitAt = Number(getConfig().send?.hardSplitAt) || 0;
+    const sendConfig = getConfig().send || {};
+    const hardSplitAt = Number(sendConfig.hardSplitAt) || 0;
+    const rawThreshold = sendConfig.forwardThreshold ?? DEFAULT_CONFIG.send.forwardThreshold;
+    const threshold = Number(rawThreshold);
+    const forwardThreshold = Number.isFinite(threshold) && threshold >= 0
+      ? Math.floor(threshold) : DEFAULT_CONFIG.send.forwardThreshold;
+    let totalChars = 0;
     const parts = [];
     for (const m of list) {
       const plain = mdToPlain(String(m ?? ''));
@@ -146,10 +181,15 @@ export class SendQueue {
       // 最后防线：任何上游畸形路径漏下来的 "[object Object]" 到这儿直接拦掉，
       // 用户永远不该在 QQ 里看到这串字符。全被拦 → 下方抛"消息内容为空"回给模型。
       if (/^\[object Object\]$/.test(plain)) continue;
+      totalChars += Array.from(plain).length; // 按 Unicode 字符计数，emoji 不按两个字计算。
       if (hardSplitAt > 0 && plain.length > hardSplitAt) parts.push(...splitForQQ(plain, hardSplitAt));
       else parts.push(plain);
     }
     if (!parts.length) throw new Error('消息内容为空');
+
+    if (forwardThreshold > 0 && totalChars > forwardThreshold) {
+      return this.#sendForwardBatch(chatKey, kind, id, parts, options);
+    }
 
     const chain = this.#chain(chatKey);
     const promises = [];
@@ -367,6 +407,34 @@ export class SendQueue {
       const ts = Date.now();
       this.store.appendSelf(chatKey, { text: label, ts, mid: data?.message_id ?? null });
       this.onSent?.({ chatKey, text: label, messageId: data?.message_id ?? null, kind: 'media' });
+      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+  /** 语音与文字共享队列、配额和成功留档；不对结果不明的发送自动重试。 */
+  sendVoice(chatKey, audio) {
+    assertVoiceTarget(chatKey);
+    const [kind, id] = chatKey.split(':');
+    const buffer = fs.readFileSync(audio.file);
+    if (!buffer.length || buffer.length > AUDIO_MAX_BYTES) return Promise.reject(new Error('语音大小无效或超过 20MB'));
+    const fingerprint = createHash('sha256').update(buffer).digest('hex');
+    // 同机协议端读取托管文件；远端协议端没有这个磁盘，用 Base64 传输。
+    let local = true;
+    if (this.onebot.httpUrl) {
+      const host = new URL(this.onebot.httpUrl).hostname;
+      local = ['127.0.0.1', 'localhost', '[::1]'].includes(host);
+    }
+    const ref = local ? toFileUri(audio.file) : `base64://${buffer.toString('base64')}`;
+    return this.#chain(chatKey)(async () => {
+      assertVoiceTarget(chatKey);
+      if (this.#isDuplicate(chatKey, `__voice__${fingerprint}`)) throw new Error('这段语音刚刚发过，已跳过重复发送');
+      this.#checkRate(chatKey);
+      await sleep(randInt(500, 1300));
+      const data = await this.onebot.sendRecord(kind, id, ref);
+      this.#markSent(chatKey, `__voice__${fingerprint}`);
+      const text = `[语音:${audio.name || '音频'}]`;
+      this.store.appendSelf(chatKey, { text, ts: Date.now(), mid: data?.message_id ?? null });
+      this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null, kind: 'voice' });
       return { message_id: data?.message_id ?? null };
     });
   }

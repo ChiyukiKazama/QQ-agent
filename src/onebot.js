@@ -354,6 +354,30 @@ export class OneBotClient {
     return this.sendSegments(kind, id, segments);
   }
 
+  /** 把本次待发文本作为当前账号的多个节点，一次发送合并转发。 */
+  async sendForward(kind, id, texts, options = {}) {
+    if (kind !== 'group' && kind !== 'private') throw new Error(`非法消息类型：${kind}`);
+    if (!Array.isArray(texts) || !texts.length) throw new Error('转发消息内容为空');
+    const prefix = OneBotClient.#replyAtSegments(options);
+    if (!this.selfId) this.selfInfo = await this.call('get_login_info');
+    if (!/^[1-9]\d*$/.test(this.selfId)) throw new Error('无法取得当前 QQ 账号，不能发送合并转发');
+    const messages = texts.map((text, index) => ({
+      type: 'node',
+      data: {
+        // SnowLuma / NapCat 使用 user_id + nickname；兼容采用 uin + name 的网关。
+        user_id: this.selfId, uin: this.selfId,
+        nickname: this.selfNickname || this.selfId, name: this.selfNickname || this.selfId,
+        content: [
+          ...(index === 0 ? prefix : []),
+          { type: 'text', data: { text: escapeCqText(String(text ?? '')) } }
+        ]
+      }
+    }));
+    return this.call(kind === 'group' ? 'send_group_forward_msg' : 'send_private_forward_msg', {
+      [kind === 'group' ? 'group_id' : 'user_id']: Number(id), messages
+    });
+  }
+
   async sendSticker(kind, id, imageUrl, { replyToMessageId = null, atUserId = null } = {}) {
     const segments = OneBotClient.#replyAtSegments({ replyToMessageId, atUserId });
     segments.push({ type: 'image', data: { file: String(imageUrl) } });
@@ -385,6 +409,12 @@ export class OneBotClient {
     const segments = OneBotClient.#replyAtSegments({ replyToMessageId, atUserId });
     segments.push({ type: 'image', data: { file: ref } });
     return this.sendSegments(kind, id, segments);
+  }
+
+  async sendRecord(kind, id, fileRef) {
+    if (kind !== 'group' && kind !== 'private') throw new Error('无效语音目标');
+    if (!String(fileRef || '').trim()) throw new Error('语音文件为空');
+    return this.sendSegments(kind, id, [{ type: 'record', data: { file: String(fileRef) } }]);
   }
 
   async sendPoke(kind, id, targetUserId) {
